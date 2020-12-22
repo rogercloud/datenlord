@@ -46,6 +46,9 @@ use super::protocol::{
     FUSE_VOL_RENAME, FUSE_XTIMES,
 };
 
+use super::splice::Pipe;
+use super::buffer::UnionBuffer;
+
 /// We generally support async reads
 #[cfg(target_os = "linux")]
 const INIT_FLAGS: u32 = FUSE_ASYNC_READ;
@@ -88,6 +91,8 @@ pub struct Session {
     proto_version: AtomicCell<ProtoVersion>,
     /// The underlying FUSE file system
     filesystem: Arc<Mutex<FileSystem>>,
+    /// Enable splice flag
+    splice: bool,
 }
 
 impl Drop for Session {
@@ -120,7 +125,7 @@ impl Session {
     }
 
     /// Create FUSE session
-    pub async fn new(mount_path: &Path) -> anyhow::Result<Self> {
+    pub async fn new(mount_path: &Path, splice: bool) -> anyhow::Result<Self> {
         // let mount_path = Path::new(mount_point);
         assert!(
             mount_path.is_dir(),
@@ -137,21 +142,22 @@ impl Session {
             fuse_fd,
             proto_version: AtomicCell::new(ProtoVersion::UNSPECIFIED),
             filesystem: Arc::new(Mutex::new(filesystem)),
+            splice
         })
     }
 
     /// Run the FUSE session
     pub async fn run(&self) -> anyhow::Result<()> {
         let (pool_sender, pool_receiver) = self
-            .setup_buffer_pool()
+            .setup_buffer_pool(self.splice)
             .await
             .context("failed to setup buffer pool")?;
         let fuse_dev_fd = self.dev_fd();
         loop {
             let (buffer_idx, mut byte_buffer) = pool_receiver.recv()?;
 
-            let (res, byte_buffer) = blocking!(
-                let res = unistd::read(fuse_dev_fd, &mut *byte_buffer);
+            let (res, mut byte_buffer) = blocking!(
+                let res = byte_buffer.read(fuse_dev_fd);
                 (res, byte_buffer)
             );
 
@@ -172,6 +178,7 @@ impl Session {
                         fs,
                         sender,
                         proto_version,
+                        self.splice,
                     ))
                     // .await; // Run in series
                     .detach(); // Run in parallel
@@ -221,12 +228,13 @@ impl Session {
     /// Process one FUSE request
     async fn process_fuse_request(
         buffer_idx: u16,
-        byte_buffer: AlignedBytes,
+        byte_buffer: UnionBuffer,
         read_size: usize,
         fuse_fd: RawFd,
         fs: Arc<Mutex<FileSystem>>,
-        sender: Sender<(u16, AlignedBytes)>,
+        sender: Sender<(u16, UnionBuffer)>,
         proto_version: ProtoVersion,
+        splice: bool,
     ) {
         let bytes = byte_buffer.get(..read_size).unwrap_or_else(|| {
             panic!(
@@ -234,7 +242,7 @@ impl Session {
                 read_size, buffer_idx,
             )
         });
-        let fuse_req = match Request::new(bytes, proto_version) {
+        let fuse_req = match Request::new(bytes, read_size, proto_version) {
             // Dispatch request
             Ok(r) => r,
             // Quit on illegal request
@@ -244,7 +252,7 @@ impl Session {
             }
         };
         debug!("received FUSE req={}", fuse_req);
-        let res = dispatch(&fuse_req, fuse_fd, fs).await;
+        let res = dispatch(&fuse_req, fuse_fd, fs, splice).await;
         if let Err(e) = res {
             panic!(
                 "failed to process req={:?}, the error is: {}",
@@ -264,12 +272,13 @@ impl Session {
     /// Setup buffer pool
     async fn setup_buffer_pool(
         &self,
-    ) -> anyhow::Result<(Sender<(u16, AlignedBytes)>, Receiver<(u16, AlignedBytes)>)> {
+        splice: bool,
+    ) -> anyhow::Result<(Sender<(u16, UnionBuffer)>, Receiver<(u16, UnionBuffer)>)> {
         let (pool_sender, pool_receiver) =
-            crossbeam_channel::bounded::<(u16, AlignedBytes)>(MAX_BACKGROUND.into());
+            crossbeam_channel::bounded::<(u16, UnionBuffer)>(MAX_BACKGROUND.into());
 
         (0..MAX_BACKGROUND).for_each(|i| {
-            let buf = AlignedBytes::new_zeroed(BUFFER_SIZE.cast(), PAGE_SIZE);
+            let buf = UnionBuffer::new(splice);
             let res = pool_sender.send((i, buf));
             if let Err(e) = res {
                 panic!(
@@ -279,10 +288,11 @@ impl Session {
             }
         });
 
+        // Fuse dev init
         let fuse_fd = self.dev_fd();
         let (idx, mut byte_buf) = pool_receiver.recv()?;
         let read_result = blocking!(
-            let res = unistd::read(fuse_fd, &mut *byte_buf);
+            let res = byte_buf.read(fuse_fd);
             (res, byte_buf)
         );
         byte_buf = read_result.1;
@@ -302,6 +312,7 @@ impl Session {
                 }
             }
         }
+
         pool_sender.send((idx, byte_buf)).context(format!(
             "failed to put buffer idx={} back to buffer pool after FUSE init",
             idx,
@@ -414,6 +425,7 @@ async fn dispatch<'a>(
     req: &'a Request<'a>,
     fd: RawFd,
     fs: Arc<Mutex<FileSystem>>,
+    splice: bool
 ) -> nix::Result<usize> {
     // TODO: consider remove this global lock to filesystem
     let mut filesystem = fs.lock().await;

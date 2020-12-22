@@ -48,11 +48,12 @@ use fuse::session::Session;
 
 /// Argument name of FUSE mount point
 const MOUNT_POINT_ARG_NAME: &str = "mountpoint";
+const ENABLE_SPLICE_ARG_NAEM: &str = "splice";
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
 
-    let matches = clap::App::new("DatenLord")
+    let args = clap::App::new("DatenLord")
         .about("Cloud Native Storage")
         .arg(
             clap::Arg::with_name(MOUNT_POINT_ARG_NAME)
@@ -66,16 +67,33 @@ fn main() -> anyhow::Result<()> {
                         required argument, no default value",
                 ),
         )
+        .arg(
+            clap::Arg::with_name(ENABLE_SPLICE_ARG_NAEM)
+                .long(ENABLE_SPLICE_ARG_NAEM)
+                .short("s")
+                .takes_value(false)
+                .required(false)
+                .help("Add this option to enable splice read/write in fuse"),
+        )
         .get_matches();
-    let mount_point = match matches.value_of(MOUNT_POINT_ARG_NAME) {
+
+    let mount_point = match args.value_of(MOUNT_POINT_ARG_NAME) {
         Some(mp) => mp,
         None => panic!("No mount point input"),
     };
 
     debug!("FUSE mount point: {}", mount_point);
 
+    let enable_splice = args.is_present(ENABLE_SPLICE_ARG_NAEM);
+
+    debug!("FUSE mount point: {}", mount_point);
+
     smol::run(async move {
-        let ss = Session::new(std::path::Path::new(&mount_point)).await?;
+        let ss = Session::new(
+            std::path::Path::new(&mount_point),
+            enable_splice,
+        )
+        .await?;
         ss.run().await?;
         Ok(())
     })

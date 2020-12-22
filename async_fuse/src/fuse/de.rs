@@ -2,6 +2,7 @@
 
 use super::abi_marker::FuseAbiData;
 use super::context::ProtoVersion;
+use super::buffer::UnionBuffer;
 
 use std::ffi::OsStr;
 use std::mem;
@@ -15,7 +16,8 @@ use memchr::memchr;
 #[derive(Debug)]
 pub struct Deserializer<'b> {
     /// inner bytes
-    bytes: &'b [u8],
+    bytes: &'b mut UnionBuffer,
+    left: usize,
 }
 
 /// Types which can be decoded from bytes
@@ -88,12 +90,12 @@ fn check_size(len: usize, need: usize) -> Result<(), DeserializeError> {
 
 impl<'b> Deserializer<'b> {
     /// Create `Deserializer`
-    pub const fn new(bytes: &'b [u8]) -> Deserializer<'b> {
-        Self { bytes }
+    pub const fn new(bytes: &'b mut UnionBuffer, size: usize) -> Deserializer<'b> {
+        Self { bytes, left: size}
     }
 
     /// pop some bytes without length check
-    unsafe fn pop_bytes_unchecked(&mut self, len: usize) -> &'b [u8] {
+    unsafe fn pop_bytes_unchecked(&mut self, len: usize) -> &[u8] {
         let bytes = self.bytes.get_unchecked(..len);
         self.bytes = self.bytes.get_unchecked(len..);
         bytes

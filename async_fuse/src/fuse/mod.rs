@@ -14,3 +14,5 @@ pub mod mount;
 #[allow(clippy::integer_arithmetic)]
 pub mod protocol;
 pub mod session;
+pub mod splice;
+pub mod buffer;

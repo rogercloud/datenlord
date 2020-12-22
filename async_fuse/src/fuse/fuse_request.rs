@@ -16,6 +16,7 @@ use super::protocol::{
     FuseMkDirIn, FuseMkNodIn, FuseOpCode, FuseOpenIn, FusePollIn, FuseReadIn, FuseReleaseIn,
     FuseRename2In, FuseRenameIn, FuseSetAttrIn, FuseSetXAttrIn, FuseWriteIn,
 };
+use super::buffer::UnionBuffer;
 
 /// FUSE operation
 #[derive(Debug)]
@@ -746,16 +747,15 @@ impl fmt::Display for Request<'_> {
 
 impl<'a> Request<'a> {
     /// Build FUSE request
-    pub fn new(bytes: &'a [u8], proto_version: ProtoVersion) -> anyhow::Result<Self> {
-        let data_len = bytes.len();
+    pub fn new(bytes: &'a mut UnionBuffer, size: usize, proto_version: ProtoVersion) -> anyhow::Result<Self> {
         let mut de = Deserializer::new(bytes);
         // Parse header
         let header = de.fetch_ref::<FuseInHeader>()?;
         // Check data size
         debug_assert!(
-            data_len >= header.len.cast(), // TODO: why not daten_len == header.len?
+            size >= header.len.cast(), // TODO: why not daten_len == header.len?
             "failed to assert {} >= {}",
-            data_len,
+            size,
             header.len,
         );
         // Parse/check operation arguments

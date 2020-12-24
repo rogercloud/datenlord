@@ -17,7 +17,7 @@ use utilities::{Cast, OverflowArithmetic};
 
 use super::dir::DirEntry;
 use super::fs_util::{self, FileAttr};
-use crate::fuse::protocol::INum;
+use crate::fuse::{protocol::INum, buffer::UnionBuffer};
 
 // /// The symlink target node data
 // #[derive(Debug)]
@@ -1041,14 +1041,15 @@ impl Node {
     }
 
     /// Write to file
+    /// if write_to_disk is enabled and the data is in pipe, use splice
     pub async fn write_file(
         &mut self,
         fh: u64,
         offset: i64,
-        data: Vec<u8>,
+        data: UnionBuffer,
         oflags: OFlag,
         write_to_disk: bool,
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<(UnionBuffer, usize)> {
         let ino = self.get_ino();
         let file_data_vec = match self.data {
             NodeData::Directory(..) | NodeData::SymLink(..) => {
@@ -1057,44 +1058,46 @@ impl Node {
             NodeData::RegFile(ref mut file_data) => file_data,
         };
 
-        let size_after_write = data.len().overflow_add(offset.cast::<usize>());
-        if file_data_vec.capacity() < size_after_write {
-            let before_cap = file_data_vec.capacity();
-            let extra_space_size = size_after_write.overflow_sub(file_data_vec.capacity());
-            file_data_vec.reserve(extra_space_size);
-            // TODO: handle OOM when reserving
-            // let result = file_data.try_reserve(extra_space_size);
-            // if result.is_err() {
-            //     warn!(
-            //         "write_file() cannot reserve enough space, \
-            //            the write space needed {} bytes",
-            //         extra_space_size);
-            //     reply.error(ENOMEM);
-            //     return;
-            // }
-            debug!(
-                "write_file() enlarged the file data vector capacity from {} to {}",
-                before_cap,
-                file_data_vec.capacity(),
-            );
-        }
-        match file_data_vec.len().cmp(&(offset.cast())) {
-            std::cmp::Ordering::Greater => {
-                file_data_vec.truncate(offset.cast());
+        if !data.is_pipe() {
+            let size_after_write = data.len().overflow_add(offset.cast::<usize>());
+            if file_data_vec.capacity() < size_after_write {
+                let before_cap = file_data_vec.capacity();
+                let extra_space_size = size_after_write.overflow_sub(file_data_vec.capacity());
+                file_data_vec.reserve(extra_space_size);
+                // TODO: handle OOM when reserving
+                // let result = file_data.try_reserve(extra_space_size);
+                // if result.is_err() {
+                //     warn!(
+                //         "write_file() cannot reserve enough space, \
+                //            the write space needed {} bytes",
+                //         extra_space_size);
+                //     reply.error(ENOMEM);
+                //     return;
+                // }
                 debug!(
-                    "write_file() truncated the file of ino={} to size={}",
-                    ino, offset
+                    "write_file() enlarged the file data vector capacity from {} to {}",
+                    before_cap,
+                    file_data_vec.capacity(),
                 );
             }
-            std::cmp::Ordering::Less => {
-                let zero_padding_size = offset.cast::<usize>().overflow_sub(file_data_vec.len());
-                let mut zero_padding_vec = vec![0_u8; zero_padding_size];
-                file_data_vec.append(&mut zero_padding_vec);
+            match file_data_vec.len().cmp(&(offset.cast())) {
+                std::cmp::Ordering::Greater => {
+                    file_data_vec.truncate(offset.cast());
+                    debug!(
+                        "write_file() truncated the file of ino={} to size={}",
+                        ino, offset
+                    );
+                }
+                std::cmp::Ordering::Less => {
+                    let zero_padding_size = offset.cast::<usize>().overflow_sub(file_data_vec.len());
+                    let mut zero_padding_vec = vec![0_u8; zero_padding_size];
+                    file_data_vec.append(&mut zero_padding_vec);
+                }
+                std::cmp::Ordering::Equal => (),
             }
-            std::cmp::Ordering::Equal => (),
+            // TODO: consider zero copy
+            file_data_vec.extend_from_slice(data.consume_all().unwrap());
         }
-        // TODO: consider zero copy
-        file_data_vec.extend_from_slice(&data);
 
         let fcntl_oflags = fcntl::FcntlArg::F_SETFL(oflags);
         let fd = fh.cast();
@@ -1105,7 +1108,8 @@ impl Node {
         let mut written_size = data.len();
         if write_to_disk {
             let data_len = data.len();
-            written_size = blocking!(nix::sys::uio::pwrite(fd, &data, offset))
+            let buf = data.consume_all().unwrap();
+            written_size = blocking!(nix::sys::uio::pwrite(fd, buf, offset))
                 .context("write_file() failed to write to disk")?;
             debug_assert_eq!(data_len, written_size);
         }
@@ -1113,7 +1117,7 @@ impl Node {
         self.attr.size = file_data_vec.len().cast();
         self.update_mtime_ctime_to_now();
 
-        Ok(written_size)
+        Ok((data, written_size))
     }
 
     /// Open root node

@@ -3,6 +3,7 @@
 mod abi_marker;
 mod context;
 mod de;
+mod splice;
 
 // ioctl_read!() macro involves inter arithmetic
 #[allow(clippy::integer_arithmetic)]
@@ -14,5 +15,4 @@ pub mod mount;
 #[allow(clippy::integer_arithmetic)]
 pub mod protocol;
 pub mod session;
-pub mod splice;
 pub mod buffer;

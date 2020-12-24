@@ -27,7 +27,7 @@ use crate::fuse::fuse_reply::{
     ReplyAttr, ReplyBMap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyLock, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr, StatFsParam,
 };
-use crate::fuse::fuse_request::Request;
+use crate::fuse::{fuse_request::Request, buffer::{self, UnionBuffer}};
 use crate::fuse::protocol::{FuseAttr, INum, FUSE_ROOT_ID};
 use crate::util;
 
@@ -1894,10 +1894,10 @@ impl FileSystem {
         req: &Request<'_>,
         fh: u64,
         offset: i64,
-        data: Vec<u8>,
+        data: UnionBuffer,
         flags: u32,
         reply: ReplyWrite,
-    ) -> nix::Result<usize> {
+    ) -> nix::Result<(UnionBuffer, usize)> {
         let ino = req.nodeid();
         debug!(
             "write(ino={}, fh={}, offset={}, data-size={}, flags={})",
@@ -1933,8 +1933,8 @@ impl FileSystem {
                     inode.get_name(),
                     offset,
                 );
-                reply.written(written_size.cast()).await
-            }
+                buffer::wrap_buffer(written_size.0, reply.written(written_size.1.cast()).await)
+            },
             Err(e) => {
                 debug!(
                     "write() failed to write to the file of ino={} and name={:?} at offset={}, \
@@ -1944,7 +1944,7 @@ impl FileSystem {
                     offset,
                     util::format_anyhow_error(&e),
                 );
-                reply.error(e).await
+                buffer::wrap_buffer(data, reply.error(e).await)
             }
         }
     }
@@ -2453,7 +2453,7 @@ impl FileSystem {
         &mut self,
         _req: &Request<'_>,
         _name: &OsStr,
-        _value: &[u8],
+        _value: UnionBuffer,
         _flags: u32,
         _position: u32,
         reply: ReplyEmpty,

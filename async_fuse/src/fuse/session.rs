@@ -44,7 +44,7 @@ use super::protocol::{
     FUSE_VOL_RENAME, FUSE_XTIMES,
 };
 
-use super::buffer::{UnionBuffer, BufferError};
+use super::buffer::{self, UnionBuffer, BufferError};
 
 /// We generally support async reads
 #[cfg(target_os = "linux")]
@@ -153,7 +153,7 @@ impl Session {
         loop {
             let (buffer_idx, mut byte_buffer) = pool_receiver.recv()?;
 
-            let (res, mut byte_buffer) = blocking!(
+            let (res, byte_buffer) = blocking!(
                 let res = byte_buffer.read(fuse_dev_fd);
                 (res, byte_buffer)
             );
@@ -175,7 +175,6 @@ impl Session {
                         fs,
                         sender,
                         proto_version,
-                        self.splice,
                     ))
                     // .await; // Run in series
                     .detach(); // Run in parallel
@@ -234,10 +233,8 @@ impl Session {
         fs: Arc<Mutex<FileSystem>>,
         sender: Sender<(u16, UnionBuffer)>,
         proto_version: ProtoVersion,
-        splice: bool,
     ) {
-        let mut mut_byte_buffer = byte_buffer;
-        let fuse_req = match Request::new(&mut mut_byte_buffer, read_size, proto_version) {
+        let mut fuse_req = match Request::new(byte_buffer, read_size, proto_version) {
             // Dispatch request
             Ok(r) => r,
             // Quit on illegal request
@@ -247,7 +244,7 @@ impl Session {
             }
         };
         debug!("received FUSE req={}", fuse_req);
-        let res = dispatch(&fuse_req, fuse_fd, fs, splice).await;
+        let res = dispatch(&mut fuse_req, fuse_fd, fs).await;
         if let Err(e) = res {
             panic!(
                 "failed to process req={:?}, the error is: {}",
@@ -255,7 +252,7 @@ impl Session {
                 crate::util::format_nix_error(e), // TODO: refactor format_nix_error()
             );
         }
-        let res = sender.send((buffer_idx, mut_byte_buffer));
+        let res = sender.send((buffer_idx, fuse_req.pop_buffer()));
         if let Err(e) = res {
             panic!(
                 "failed to put the {}-th buffer back to buffer pool, the error is: {}",
@@ -293,11 +290,14 @@ impl Session {
         byte_buf = read_result.1;
         if let Ok(read_size) = read_result.0 {
             debug!("read successfully {} byte data from FUSE device", read_size);
-            if let Ok(req) = Request::new(&mut byte_buf, read_size, self.proto_version.load()) {
-                if let Operation::Init { arg } = *req.operation() {
+            if let Ok(mut req) = Request::new(byte_buf, read_size, self.proto_version.load()) {
+                if let Operation::Init { arg } = req.operation().oper {
                     let filesystem = Arc::clone(&self.filesystem);
                     self.init(arg, &req, filesystem, fuse_fd).await?;
                 }
+                byte_buf = req.pop_buffer();
+            } else {
+                panic!("read first request fail");
             }
         }
 
@@ -410,15 +410,14 @@ impl Session {
 /// request and sends back the returned reply to the kernel
 #[allow(clippy::too_many_lines)]
 async fn dispatch<'a>(
-    req: &'a Request<'a>,
+    req: &'a mut Request<'a>,
     fd: RawFd,
     fs: Arc<Mutex<FileSystem>>,
-    splice: bool
-) -> nix::Result<usize> {
+) -> nix::Result<(UnionBuffer, usize)> {
     // TODO: consider remove this global lock to filesystem
     let mut filesystem = fs.lock().await;
 
-    match *req.operation() {
+    match req.operation().oper {
         // Filesystem initialization
         Operation::Init { .. } => panic!("FUSE should have already initialized"),
         // Any operation is invalid before initialization
@@ -466,14 +465,14 @@ async fn dispatch<'a>(
         {
             warn!("ignoring FUSE operation before init, the request={}", req);
             let reply = ReplyEmpty::new(req.unique(), fd);
-            reply.error_code(Errno::EIO).await
+            buffer::wrap_buffer_from_req(req, reply.error_code(Errno::EIO).await)
         }
         // Filesystem destroyed
         Operation::Destroy => {
             filesystem.destroy(req);
             FUSE_DESTROYED.fetch_or(true, Ordering::Release);
             let reply = ReplyEmpty::new(req.unique(), fd);
-            reply.ok().await
+            buffer::wrap_buffer_from_req(req, reply.ok().await)
         }
         // Any operation is invalid after destroy
         Operation::Lookup { .. }
@@ -520,25 +519,25 @@ async fn dispatch<'a>(
         {
             warn!("ignoring FUSE operation after destroy, the request={}", req);
             let reply = ReplyEmpty::new(req.unique(), fd);
-            reply.error_code(Errno::EIO).await
+            buffer::wrap_buffer_from_req(req, reply.error_code(Errno::EIO).await)
         }
 
         Operation::Interrupt { arg } => {
             filesystem.interrupt(req, arg.unique); // No reply
-            Ok(0)
+            buffer::wrap_buffer_from_req(req, Ok(0))
         }
 
         Operation::Lookup { name } => {
             let reply = ReplyEntry::new(req.unique(), fd);
-            filesystem.lookup(req, req.nodeid(), name, reply).await
+            buffer::wrap_buffer_from_req(req, filesystem.lookup(req, req.nodeid(), name, reply).await)
         }
         Operation::Forget { arg } => {
             filesystem.forget(req, arg.nlookup); // No reply
-            Ok(0)
+            buffer::wrap_buffer_from_req(req, Ok(0))
         }
         Operation::GetAttr => {
             let reply = ReplyAttr::new(req.unique(), fd);
-            filesystem.getattr(req, reply).await
+            buffer::wrap_buffer_from_req(req, filesystem.getattr(req, reply).await)
         }
         Operation::SetAttr { arg } => {
             let mode = match arg.valid & FATTR_MODE {
@@ -650,37 +649,37 @@ async fn dispatch<'a>(
                 #[cfg(target_os = "macos")]
                 flags,
             };
-            filesystem.setattr(req, param, reply).await
+            buffer::wrap_buffer_from_req(req, filesystem.setattr(req, param, reply).await)
         }
         Operation::ReadLink => {
             let reply = ReplyData::new(req.unique(), fd);
-            filesystem.readlink(req, reply).await
+            buffer::wrap_buffer_from_req(req, filesystem.readlink(req, reply).await)
         }
         Operation::MkNod { arg, name } => {
             let reply = ReplyEntry::new(req.unique(), fd);
-            filesystem
+            buffer::wrap_buffer_from_req(req, filesystem
                 .mknod(req, req.nodeid(), name, arg.mode, arg.rdev, reply)
-                .await
+                .await)
         }
         Operation::MkDir { arg, name } => {
             let reply = ReplyEntry::new(req.unique(), fd);
-            filesystem
+            buffer::wrap_buffer_from_req(req, filesystem
                 .mkdir(req, req.nodeid(), name, arg.mode, reply)
-                .await
+                .await)
         }
         Operation::Unlink { name } => {
             let reply = ReplyEmpty::new(req.unique(), fd);
-            filesystem.unlink(req, req.nodeid(), name, reply).await
+            buffer::wrap_buffer_from_req(req, filesystem.unlink(req, req.nodeid(), name, reply).await)
         }
         Operation::RmDir { name } => {
             let reply = ReplyEmpty::new(req.unique(), fd);
-            filesystem.rmdir(req, req.nodeid(), name, reply).await
+            buffer::wrap_buffer_from_req(req, filesystem.rmdir(req, req.nodeid(), name, reply).await)
         }
         Operation::SymLink { name, link } => {
             let reply = ReplyEntry::new(req.unique(), fd);
-            filesystem
+            buffer::wrap_buffer_from_req(req, filesystem
                 .symlink(req, req.nodeid(), name, Path::new(link), reply)
-                .await
+                .await)
         }
         Operation::Rename {
             arg,
@@ -695,23 +694,24 @@ async fn dispatch<'a>(
                 new_name: newname.to_os_string(),
                 flags: 0,
             };
-            filesystem.rename(req, param, reply).await
+            buffer::wrap_buffer_from_req(req, filesystem.rename(req, param, reply).await)
         }
         Operation::Link { arg, name } => {
             let reply = ReplyEntry::new(req.unique(), fd);
-            filesystem.link(req, arg.oldnodeid, name, reply).await
+            buffer::wrap_buffer_from_req(req, filesystem.link(req, arg.oldnodeid, name, reply).await)
         }
         Operation::Open { arg } => {
             let reply = ReplyOpen::new(req.unique(), fd);
-            filesystem.open(req, arg.flags, reply).await
+            buffer::wrap_buffer_from_req(req, filesystem.open(req, arg.flags, reply).await)
         }
         Operation::Read { arg } => {
             let reply = ReplyData::new(req.unique(), fd);
-            filesystem
+            buffer::wrap_buffer_from_req(req, filesystem
                 .read(req, arg.fh, arg.offset.cast(), arg.size, reply)
-                .await
+                .await)
         }
-        Operation::Write { arg, data } => {
+        Operation::Write { arg } => {
+            let data = req.pop_buffer();
             assert_eq!(data.len(), arg.size.cast());
             let reply = ReplyWrite::new(req.unique(), fd);
             filesystem
@@ -719,7 +719,7 @@ async fn dispatch<'a>(
                     req,
                     arg.fh,
                     arg.offset.cast(),
-                    data.to_vec(), // TODO: consider zero copy
+                    data,
                     arg.write_flags,
                     reply,
                 )
@@ -764,7 +764,7 @@ async fn dispatch<'a>(
             let reply = ReplyStatFs::new(req.unique(), fd);
             filesystem.statfs(req, reply).await
         }
-        Operation::SetXAttr { arg, name, value } => {
+        Operation::SetXAttr { arg, name } => {
             /// Set the position of an extended attribute
             /// macOS only
             #[cfg(target_os = "macos")]
@@ -779,10 +779,10 @@ async fn dispatch<'a>(
             const fn get_position(_arg: &FuseSetXAttrIn) -> u32 {
                 0
             }
-            assert!(value.len() == arg.size.cast());
+            //assert!(value.len() == arg.size.cast());
             let reply = ReplyEmpty::new(req.unique(), fd);
             filesystem
-                .setxattr(req, name, value, arg.flags, get_position(arg), reply)
+                .setxattr(req, name, req.pop_buffer(), arg.flags, get_position(arg), reply)
                 .await
         }
         Operation::GetXAttr { arg, name } => {
@@ -854,8 +854,8 @@ async fn dispatch<'a>(
         }
 
         // #[cfg(feature = "abi-7-11")]
-        Operation::IoCtl { arg, data } => {
-            error!("IoCtl not implemented, arg={:?}, data={:?}", arg, data);
+        Operation::IoCtl { arg } => {
+            error!("IoCtl not implemented, arg={:?}", arg);
             filesystem.not_implement_helper(req, fd).await
         }
         // #[cfg(feature = "abi-7-11")]
@@ -864,8 +864,8 @@ async fn dispatch<'a>(
             filesystem.not_implement_helper(req, fd).await
         }
         // #[cfg(feature = "abi-7-15")]
-        Operation::NotifyReply { data } => {
-            error!("NotifyReply not implemented, data={:?}", data);
+        Operation::NotifyReply { } => {
+            error!("NotifyReply not implemented");
             filesystem.not_implement_helper(req, fd).await
         }
         // #[cfg(feature = "abi-7-16")]

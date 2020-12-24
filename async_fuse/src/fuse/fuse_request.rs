@@ -18,6 +18,20 @@ use super::protocol::{
 };
 use super::buffer::UnionBuffer;
 
+/// FUSE operation wrap, holding both oper and data
+#[derive(Debug)]
+pub struct OperationAndData<'a> {
+    pub oper: Operation<'a>,
+    pub data: Option<UnionBuffer>,
+}
+
+/// Only display `Operation` for `OperationAndData`
+impl fmt::Display for OperationAndData <'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.oper)
+    }
+}
+
 /// FUSE operation
 #[derive(Debug)]
 pub enum Operation<'a> {
@@ -101,8 +115,6 @@ pub enum Operation<'a> {
     Write {
         /// The FUSE write request
         arg: &'a FuseWriteIn,
-        /// The FUSE write request data
-        data: &'a [u8],
     },
     /// FUSE_STATFS = 17
     StatFs,
@@ -122,8 +134,6 @@ pub enum Operation<'a> {
         arg: &'a FuseSetXAttrIn,
         /// The extended attribute name
         name: &'a OsStr,
-        /// The extended attribute value
-        value: &'a [u8],
     },
     /// FUSE_GETXATTR = 22
     GetXAttr {
@@ -216,8 +226,6 @@ pub enum Operation<'a> {
     IoCtl {
         /// The FUSE ioctl request
         arg: &'a FuseIoCtlIn,
-        /// The ioctl request data
-        data: &'a [u8],
     },
     /// FUSE_POLL = 40
     // #[cfg(feature = "abi-7-11")]
@@ -228,8 +236,6 @@ pub enum Operation<'a> {
     /// FUSE_NOTIFY_REPLY = 41
     // #[cfg(feature = "abi-7-15")]
     NotifyReply {
-        /// FUSE notify reply data
-        data: &'a [u8],
     },
     /// FUSE_BATCH_FORGET = 42
     // #[cfg(feature = "abi-7-16")]
@@ -301,12 +307,12 @@ pub enum Operation<'a> {
     },
 }
 
-impl<'a> Operation<'a> {
+impl<'a> OperationAndData<'a> {
     /// Build FUSE operation from op-code
     #[allow(clippy::too_many_lines)]
     fn parse(
         n: u32,
-        data: &mut Deserializer<'a>,
+        data: &'a mut Deserializer,
         #[allow(unused_variables)] proto_version: ProtoVersion,
     ) -> anyhow::Result<Self> {
         let opcode = match n {
@@ -378,7 +384,7 @@ impl<'a> Operation<'a> {
             _ => panic!("unknown FUSE OpCode={}", n),
         };
 
-        Ok(match opcode {
+        let operation = match opcode {
             FuseOpCode::FUSE_LOOKUP => Operation::Lookup {
                 name: data.fetch_os_str()?,
             },
@@ -425,7 +431,6 @@ impl<'a> Operation<'a> {
             },
             FuseOpCode::FUSE_WRITE => Operation::Write {
                 arg: data.fetch_ref()?,
-                data: data.fetch_all_bytes(),
             },
             FuseOpCode::FUSE_STATFS => Operation::StatFs,
             FuseOpCode::FUSE_RELEASE => Operation::Release {
@@ -437,7 +442,6 @@ impl<'a> Operation<'a> {
             FuseOpCode::FUSE_SETXATTR => Operation::SetXAttr {
                 arg: data.fetch_ref()?,
                 name: data.fetch_os_str()?,
-                value: data.fetch_all_bytes(),
             },
             FuseOpCode::FUSE_GETXATTR => Operation::GetXAttr {
                 arg: data.fetch_ref()?,
@@ -493,7 +497,6 @@ impl<'a> Operation<'a> {
             // #[cfg(feature = "abi-7-11")]
             FuseOpCode::FUSE_IOCTL => Operation::IoCtl {
                 arg: data.fetch_ref()?,
-                data: data.fetch_all_bytes(),
             },
             // #[cfg(feature = "abi-7-11")]
             FuseOpCode::FUSE_POLL => Operation::Poll {
@@ -501,7 +504,6 @@ impl<'a> Operation<'a> {
             },
             // #[cfg(feature = "abi-7-15")]
             FuseOpCode::FUSE_NOTIFY_REPLY => Operation::NotifyReply {
-                data: data.fetch_all_bytes(),
             },
             // #[cfg(feature = "abi-7-16")]
             FuseOpCode::FUSE_BATCH_FORGET => Operation::BatchForget {
@@ -548,7 +550,9 @@ impl<'a> Operation<'a> {
             FuseOpCode::CUSE_INIT => Operation::CuseInit {
                 arg: data.fetch_ref()?,
             },
-        })
+        };
+
+        Ok(Self{oper: operation, data: Some(data.pop_buffer())})
     }
 }
 
@@ -659,17 +663,17 @@ impl fmt::Display for Operation<'_> {
             Operation::Destroy => write!(f, "DESTROY"),
 
             // #[cfg(feature = "abi-7-11")]
-            Operation::IoCtl { arg, data } => write!(
+            Operation::IoCtl { arg } => write!(
                 f,
-                "IOCTL fh={}, flags {:#x}, cmd={}, arg={}, data={:?}",
-                arg.fh, arg.flags, arg.cmd, arg.arg, data,
+                "IOCTL fh={}, flags {:#x}, cmd={}, arg={}",
+                arg.fh, arg.flags, arg.cmd, arg.arg,
             ),
             // #[cfg(feature = "abi-7-11")]
             Operation::Poll { arg } => {
                 write!(f, "POLL fh={}, kh={}, flags={:#x} ", arg.fh, arg.kh, arg.flags)
             }
             // #[cfg(feature = "abi-7-15")]
-            Operation::NotifyReply { data } => write!(f, "NOTIFY REPLY data={:?}", data),
+            Operation::NotifyReply { } => write!(f, "NOTIFY REPLY data=[]"),
             // #[cfg(feature = "abi-7-16")]
             Operation::BatchForget { arg, nodes } => {
                 write!(f, "BATCH FORGOT count={}, nodes={:?}", arg.count, nodes)
@@ -732,7 +736,7 @@ pub struct Request<'a> {
     /// FUSE request header
     header: &'a FuseInHeader,
     /// FUSE request operation
-    operation: Operation<'a>,
+    operation: OperationAndData <'a>,
 }
 
 impl fmt::Display for Request<'_> {
@@ -745,9 +749,10 @@ impl fmt::Display for Request<'_> {
     }
 }
 
-impl Request {
+impl<'a> Request<'a> {
     /// Build FUSE request
-    pub fn new(bytes: &mut UnionBuffer, size: usize, proto_version: ProtoVersion) -> anyhow::Result<Self> {
+    pub fn new(bytes: UnionBuffer, size: usize, proto_version: ProtoVersion) -> anyhow::Result<Self> {
+        // move bytes into de
         let mut de = Deserializer::new(bytes, size);
         // Parse header
         let header = de.fetch_ref::<FuseInHeader>()?;
@@ -758,8 +763,8 @@ impl Request {
             size,
             header.len,
         );
-        // Parse/check operation arguments
-        let operation = Operation::parse(header.opcode, &mut de, proto_version)?;
+        // Parse/check operation arguments, move bytes out of de
+        let operation = OperationAndData::parse(header.opcode, &mut de, proto_version)?;
         if de.remaining_len() > 0 {
             warn!(
                 "request bytes is not completely consumed: \
@@ -772,6 +777,10 @@ impl Request {
         }
 
         Ok(Self { header, operation })
+    }
+
+    pub fn pop_buffer(&mut self) -> UnionBuffer {
+        self.operation.data.take().unwrap()
     }
 
     /// Returns the unique identifier of this request.
@@ -820,8 +829,8 @@ impl Request {
 
     /// Returns the filesystem operation (and its arguments) of this request.
     #[inline]
-    pub const fn operation(&self) -> &Operation<'_> {
-        &self.operation
+    pub const fn operation(&self) -> &mut OperationAndData<'a> {
+        &mut self.operation
     }
 }
 
@@ -937,7 +946,7 @@ mod test {
         assert_eq!(req.gid(), 0xc001_cafe);
         assert_eq!(req.pid(), 0xc0de_ba5e);
         #[allow(clippy::wildcard_enum_match_arm)]
-        match *req.operation() {
+        match req.operation() {
             Operation::Init { arg } => {
                 assert_eq!(arg.major, 7);
                 assert_eq!(arg.minor, 8);
@@ -959,7 +968,7 @@ mod test {
         assert_eq!(req.gid(), 0xc001_cafe);
         assert_eq!(req.pid(), 0xc0de_ba5e);
         #[allow(clippy::wildcard_enum_match_arm)]
-        match *req.operation() {
+        match req.operation() {
             Operation::MkNod { arg, name } => {
                 assert_eq!(arg.mode, 0o644);
                 assert_eq!(name, "foo.txt");

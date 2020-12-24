@@ -1,7 +1,6 @@
 //! FUSE protocol deserializer
 
 use super::abi_marker::FuseAbiData;
-use super::context::ProtoVersion;
 use super::buffer::UnionBuffer;
 
 use std::ffi::OsStr;
@@ -10,24 +9,13 @@ use std::slice;
 
 use better_as::pointer;
 use log::trace;
-use memchr::memchr;
 
 /// FUSE protocol deserializer
 #[derive(Debug)]
-pub struct Deserializer<'b> {
+pub struct Deserializer {
     /// inner bytes
-    bytes: &'b mut UnionBuffer,
+    bytes: Option<UnionBuffer>,
     left: usize,
-}
-
-/// Types which can be decoded from bytes
-#[allow(single_use_lifetimes)]
-pub trait Deserialize<'b>: Sized {
-    /// Deserialize from bytes
-    fn deserialize(
-        de: &'_ mut Deserializer<'b>,
-        proto_version: ProtoVersion,
-    ) -> Result<Self, DeserializeError>;
 }
 
 /// The error returned by `Deserializer`
@@ -88,51 +76,61 @@ fn check_size(len: usize, need: usize) -> Result<(), DeserializeError> {
     Ok(())
 }
 
-impl<'b> Deserializer<'b> {
+impl Deserializer {
     /// Create `Deserializer`
-    pub const fn new(bytes: &'b mut UnionBuffer, size: usize) -> Deserializer<'b> {
-        Self { bytes, left: size }
+    pub const fn new(bytes: UnionBuffer, size: usize) -> Deserializer {
+        Self { bytes: Some(bytes), left: size }
+    }
+
+    /// Get buffer ref
+    pub fn get_buffer(&self) -> &mut UnionBuffer {
+        &mut self.bytes.unwrap()
+    }
+
+    /// Take buffer out of `Deserializer`
+    pub fn pop_buffer(&mut self) -> UnionBuffer {
+        self.bytes.take().unwrap()
     }
 
     /// pop some bytes without length check
-    unsafe fn pop_bytes_unchecked(&mut self, len: usize) -> &'b [u8] {
-        let bytes = self.bytes.consume(len).unwrap_or_else(|err| {
+    unsafe fn pop_bytes_unchecked(&mut self, len: usize) -> &[u8] {
+        let bytes = self.bytes.unwrap().consume(len).unwrap_or_else(|err| {
             panic!("Consume {} byte error {}", len, err);
         });
         self.left -= len;
-        bytes.as_slice()
+        bytes
     }
 
     /// Get the length of the remaining bytes
     pub const fn remaining_len(&self) -> usize {
-        self.bytes.len()
+        self.bytes.unwrap().len()
     }
 
     /// Fetch all remaining bytes
-    pub fn fetch_all_bytes(&mut self) -> &'b [u8] {
+    pub fn fetch_all_bytes(&mut self) -> & [u8] {
         unsafe {
-            let bytes = self.bytes.consume(self.left).unwrap_or_else(|err| {
-            panic!("Consume {} byte error {}", self.left, err);
-        });
+            let bytes = self.bytes.unwrap().consume(self.left).unwrap_or_else(|err| {
+                panic!("Consume {} byte error {}", self.left, err);
+            });
             self.left = 0;
-            bytes.as_slice()
+            bytes
         }
     }
 
     /// Fetch specified amount of bytes
     #[allow(dead_code)]
-    pub fn fetch_bytes(&mut self, amt: usize) -> Result<&'b [u8], DeserializeError> {
-        check_size(self.bytes.len(), amt)?;
+    pub fn fetch_bytes(&mut self, amt: usize) -> Result<&[u8], DeserializeError> {
+        check_size(self.bytes.unwrap().len(), amt)?;
         unsafe { Ok(self.pop_bytes_unchecked(amt)) }
     }
 
     /// Fetch some bytes and transmute to `&T`
-    pub fn fetch_ref<T: FuseAbiData + Sized>(&mut self) -> Result<&'b T, DeserializeError> {
+    pub fn fetch_ref<T: FuseAbiData + Sized>(&mut self) -> Result<& T, DeserializeError> {
         let ty_size: usize = mem::size_of::<T>();
         let ty_align: usize = mem::align_of::<T>();
         debug_assert!(ty_size > 0 && ty_size.wrapping_rem(ty_align) == 0);
 
-        check_size(self.bytes.len(), ty_size)?;
+        check_size(self.bytes.unwrap().len(), ty_size)?;
 
         unsafe {
             let bytes = self.pop_bytes_unchecked(ty_size);
@@ -146,7 +144,7 @@ impl<'b> Deserializer<'b> {
     pub fn fetch_slice<T: FuseAbiData + Sized>(
         &mut self,
         n: usize,
-    ) -> Result<&'b [T], DeserializeError> {
+    ) -> Result<&[T], DeserializeError> {
         let ty_size: usize = mem::size_of::<T>();
         let ty_align: usize = mem::align_of::<T>();
         debug_assert!(ty_size > 0 && ty_size.wrapping_rem(ty_align) == 0);
@@ -157,7 +155,7 @@ impl<'b> Deserializer<'b> {
             return Err(DeserializeError::NumOverflow);
         }
 
-        check_size(self.bytes.len(), size)?;
+        check_size(self.bytes.unwrap().len(), size)?;
 
         unsafe {
             let bytes = self.pop_bytes_unchecked(size);
@@ -170,15 +168,16 @@ impl<'b> Deserializer<'b> {
     /// Fetch remaining bytes and transmute to a slice of target instances
     pub fn fetch_all_as_slice<T: FuseAbiData + Sized>(
         &mut self,
-    ) -> Result<&'b [T], DeserializeError> {
+    ) -> Result<&[T], DeserializeError> {
         let ty_size: usize = mem::size_of::<T>();
         let ty_align: usize = mem::align_of::<T>();
+        let buffer = self.bytes.unwrap();
         debug_assert!(ty_size > 0 && ty_size.wrapping_rem(ty_align) == 0);
 
-        if self.bytes.len() < ty_size || self.bytes.len().wrapping_rem(ty_size) != 0 {
+        if buffer.len() < ty_size || buffer.len().wrapping_rem(ty_size) != 0 {
             trace!(
                 "no enough bytes to fetch, remaining {} bytes but to fetch (n * {}) bytes",
-                self.bytes.len(),
+                buffer.len(),
                 ty_size,
             );
             return Err(DeserializeError::NotEnough);
@@ -199,19 +198,21 @@ impl<'b> Deserializer<'b> {
     /// will take O(n) time in the future.
     ///
     /// `slice::len` is always O(1)
-    pub fn fetch_c_str(&mut self) -> Result<&'b [u8], DeserializeError> {
-        let strlen: usize = memchr(0, self.bytes)
+    pub fn fetch_c_str(&mut self) -> Result<&[u8], DeserializeError> {
+        let buffer = self.bytes.unwrap();
+        let strlen: usize = buffer
+            .memchr(0)
             .ok_or_else(|| {
                 trace!("no trailing zero in bytes, cannot fetch c-string");
                 DeserializeError::NotEnough
             })?
             .wrapping_add(1);
-        debug_assert!(strlen <= self.bytes.len());
+        debug_assert!(strlen <= buffer.len());
         unsafe { Ok(self.pop_bytes_unchecked(strlen)) }
     }
 
     /// Fetch some nul-terminated bytes and return an `OsStr` without the nul byte.
-    pub fn fetch_os_str(&mut self) -> Result<&'b OsStr, DeserializeError> {
+    pub fn fetch_os_str(&mut self) -> Result<&OsStr, DeserializeError> {
         use std::os::unix::ffi::OsStrExt;
 
         let bytes_with_nul = self.fetch_c_str()?;
@@ -231,7 +232,7 @@ impl<'b> Deserializer<'b> {
         F: FnOnce(&mut Self) -> Result<T, DeserializeError>,
     {
         let ret = f(self)?;
-        if !self.bytes.is_empty() {
+        if !self.bytes.unwrap().is_empty() {
             return Err(DeserializeError::TooMuchData);
         }
         Ok(ret)
@@ -241,57 +242,57 @@ impl<'b> Deserializer<'b> {
 #[cfg(test)]
 mod tests {
     use super::{DeserializeError, Deserializer};
+    use nix::unistd;
 
-    use aligned_bytes::stack::{align8, Align8};
+    use super::UnionBuffer;
 
     #[test]
     fn fetch_all_bytes() {
-        let buf: [u8; 8] = [0; 8];
-        let mut de = Deserializer::new(&buf, 8);
+        let buf = UnionBuffer::new(false);
+        let mut de = Deserializer::new(buf, 8);
         assert_eq!(de.fetch_all_bytes(), &[0; 8]);
-        assert_eq!(de.bytes.len(), 0);
+        assert_eq!(de.bytes.unwrap().len(), 0);
     }
 
     #[test]
     fn fetch_bytes() {
-        let buf: [u8; 8] = [0; 8];
-
-        let mut de = Deserializer::new(&buf);
+        let buf = UnionBuffer::new(false);
+        let mut de = Deserializer::new(buf, 8);
         assert_eq!(
             de.fetch_bytes(5)
                 .unwrap_or_else(|err| panic!("failed to fetch 5 bytes, the error is: {}", err,)),
             &[0; 5]
         );
-        assert_eq!(de.bytes.len(), 3);
+        assert_eq!(de.bytes.unwrap().len(), 3);
 
         assert!(de.fetch_bytes(5).is_err());
-        assert_eq!(de.bytes.len(), 3);
+        assert_eq!(de.bytes.unwrap().len(), 3);
     }
 
     #[test]
     fn fetch_ref() {
         // this buffer contains two `u32` or one `u64`
         // so it is aligned to 8 bytes
-        let buf: Align8<[u8; 8]> = align8([0, 1, 2, 3, 4, 5, 6, 7]);
-
         {
-            let mut de = Deserializer::new(&*buf);
+            let buf = UnionBuffer::new(false);
+            let mut de = Deserializer::new(buf, 8);
             assert_eq!(
                 de.fetch_ref::<u32>()
                     .unwrap_or_else(|err| panic!("failed to fetch u32, the error is: {}", err)),
                 &u32::from_ne_bytes([0, 1, 2, 3])
             );
-            assert_eq!(de.bytes.len(), 4);
+            assert_eq!(de.bytes.unwrap().len(), 4);
         }
 
         {
-            let mut de = Deserializer::new(&*buf);
+            let buf = UnionBuffer::new(false);
+            let mut de = Deserializer::new(buf, 8);
             assert_eq!(
                 de.fetch_ref::<u64>()
                     .unwrap_or_else(|err| panic!("failed to fetch u64, the error is: {}", err)),
                 &u64::from_ne_bytes([0, 1, 2, 3, 4, 5, 6, 7])
             );
-            assert_eq!(de.bytes.len(), 0);
+            assert_eq!(de.bytes.unwrap().len(), 0);
         }
     }
 
@@ -300,10 +301,9 @@ mod tests {
         // this buffer contains two `u32`
         // so it can be aligned to 4 bytes
         // it is aligned to 8 bytes here
-        let buf: Align8<[u8; 8]> = align8([0, 1, 2, 3, 4, 5, 6, 7]);
-
         {
-            let mut de = Deserializer::new(&*buf);
+            let buf = UnionBuffer::new(false);
+            let mut de = Deserializer::new(buf, 8);
             assert_eq!(
                 de.fetch_all_as_slice::<u32>().unwrap_or_else(|err| panic!(
                     "failed to fetch all data and build slice of u32, the error is: {}",
@@ -314,25 +314,29 @@ mod tests {
                     u32::from_ne_bytes([4, 5, 6, 7]),
                 ]
             );
-            assert_eq!(de.bytes.len(), 0);
+            assert_eq!(de.bytes.unwrap().len(), 0);
         }
 
         {
-            let mut de = Deserializer::new(&*buf);
+            let buf = UnionBuffer::new(false);
+            let mut de = Deserializer::new(buf, 8);
             assert!(de.fetch_bytes(3).is_ok());
             assert_eq!(
                 de.fetch_all_as_slice::<u32>().unwrap_err(),
                 DeserializeError::NotEnough
             );
-            assert_eq!(de.bytes.len(), 5)
+            assert_eq!(de.bytes.unwrap().len(), 5)
         }
     }
 
     #[test]
     fn fetch_c_str() {
-        let buf: [u8; 12] = *b"hello\0world\0";
-
-        let mut de = Deserializer::new(&buf);
+        let buf_hello: [u8; 12] = *b"hello\0world\0";
+        let pipe = unistd::pipe().unwrap_or_else(|err| panic!("Error to create pipe {}", err));
+        unistd::write(pipe.1, &buf_hello).unwrap_or_else(|err| panic!("Error to write to pipe {}", err));
+        let buf = UnionBuffer::new(false);
+        buf.read(pipe.0).unwrap_or_else(|err| panic!("Error to read pipe {}", err));
+        let mut de = Deserializer::new(buf, 12);
         assert_eq!(
             de.fetch_c_str()
                 .unwrap_or_else(|err| panic!("failed to fetch C-String, the error is: {}", err)),
@@ -343,6 +347,6 @@ mod tests {
                 .unwrap_or_else(|err| panic!("failed to fetch C-String, the error is: {}", err)),
             b"world\0".as_ref()
         );
-        assert_eq!(de.bytes.len(), 0);
+        assert_eq!(de.bytes.unwrap().len(), 0);
     }
 }

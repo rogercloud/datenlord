@@ -91,14 +91,16 @@ fn check_size(len: usize, need: usize) -> Result<(), DeserializeError> {
 impl<'b> Deserializer<'b> {
     /// Create `Deserializer`
     pub const fn new(bytes: &'b mut UnionBuffer, size: usize) -> Deserializer<'b> {
-        Self { bytes, left: size}
+        Self { bytes, left: size }
     }
 
     /// pop some bytes without length check
-    unsafe fn pop_bytes_unchecked(&mut self, len: usize) -> &[u8] {
-        let bytes = self.bytes.get_unchecked(..len);
-        self.bytes = self.bytes.get_unchecked(len..);
-        bytes
+    unsafe fn pop_bytes_unchecked(&mut self, len: usize) -> &'b [u8] {
+        let bytes = self.bytes.consume(len).unwrap_or_else(|err| {
+            panic!("Consume {} byte error {}", len, err);
+        });
+        self.left -= len;
+        bytes.as_slice()
     }
 
     /// Get the length of the remaining bytes
@@ -109,9 +111,11 @@ impl<'b> Deserializer<'b> {
     /// Fetch all remaining bytes
     pub fn fetch_all_bytes(&mut self) -> &'b [u8] {
         unsafe {
-            let bytes = self.bytes;
-            self.bytes = slice::from_raw_parts(self.bytes.as_ptr(), 0);
-            bytes
+            let bytes = self.bytes.consume(self.left).unwrap_or_else(|err| {
+            panic!("Consume {} byte error {}", self.left, err);
+        });
+            self.left = 0;
+            bytes.as_slice()
         }
     }
 
@@ -129,10 +133,10 @@ impl<'b> Deserializer<'b> {
         debug_assert!(ty_size > 0 && ty_size.wrapping_rem(ty_align) == 0);
 
         check_size(self.bytes.len(), ty_size)?;
-        check_align::<T>(self.bytes.as_ptr())?;
 
         unsafe {
             let bytes = self.pop_bytes_unchecked(ty_size);
+            check_align::<T>(bytes.as_ptr())?;
             Ok(&*(bytes.as_ptr().cast()))
         }
     }
@@ -154,10 +158,10 @@ impl<'b> Deserializer<'b> {
         }
 
         check_size(self.bytes.len(), size)?;
-        check_align::<T>(self.bytes.as_ptr())?;
 
         unsafe {
             let bytes = self.pop_bytes_unchecked(size);
+            check_align::<T>(bytes.as_ptr())?;
             let base: *const T = bytes.as_ptr().cast();
             Ok(slice::from_raw_parts(base, n))
         }
@@ -180,9 +184,8 @@ impl<'b> Deserializer<'b> {
             return Err(DeserializeError::NotEnough);
         }
 
-        check_align::<T>(self.bytes.as_ptr())?;
-
         let bytes = self.fetch_all_bytes();
+        check_align::<T>(bytes.as_ptr())?;
         unsafe {
             let base: *const T = bytes.as_ptr().cast();
             let len = bytes.len().wrapping_div(ty_size);
@@ -244,7 +247,7 @@ mod tests {
     #[test]
     fn fetch_all_bytes() {
         let buf: [u8; 8] = [0; 8];
-        let mut de = Deserializer::new(&buf);
+        let mut de = Deserializer::new(&buf, 8);
         assert_eq!(de.fetch_all_bytes(), &[0; 8]);
         assert_eq!(de.bytes.len(), 0);
     }

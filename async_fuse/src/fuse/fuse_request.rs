@@ -745,10 +745,10 @@ impl fmt::Display for Request<'_> {
     }
 }
 
-impl<'a> Request<'a> {
+impl Request {
     /// Build FUSE request
-    pub fn new(bytes: &'a mut UnionBuffer, size: usize, proto_version: ProtoVersion) -> anyhow::Result<Self> {
-        let mut de = Deserializer::new(bytes);
+    pub fn new(bytes: &mut UnionBuffer, size: usize, proto_version: ProtoVersion) -> anyhow::Result<Self> {
+        let mut de = Deserializer::new(bytes, size);
         // Parse header
         let header = de.fetch_ref::<FuseInHeader>()?;
         // Check data size

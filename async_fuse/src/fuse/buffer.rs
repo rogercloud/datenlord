@@ -1,8 +1,8 @@
 use super::splice;
 use aligned_bytes::AlignedBytes;
-use nix::{fcntl, unistd};
+use libc;
+use nix::{self, fcntl, unistd};
 use std::os::unix::io::RawFd;
-use thiserror;
 use utilities::Cast;
 
 /// The max size of write requests from the kernel. The absolute minimum is 4k,
@@ -38,10 +38,11 @@ pub enum BufferError {
 
     /// Nix error
     #[error("NixInternal")]
-    NixInternal(String),
+    NixInternal(nix::Error),
 }
 
 impl UnionBuffer {
+    /// Constructor to create a UnionBuffer instance
     pub fn new(is_pipe: bool) -> Self {
         Self {
             byte: AlignedBytes::new_zeroed(BUFFER_SIZE.cast(), PAGE_SIZE),
@@ -67,7 +68,7 @@ impl UnionBuffer {
 
         match result {
             Ok(read_size) => Ok(read_size),
-            Err(err) => Err(BufferError::NixInternal(crate::util::format_nix_error(err))),
+            Err(err) => Err(BufferError::NixInternal(err)),
         }
     }
 
@@ -76,20 +77,38 @@ impl UnionBuffer {
             let buffer = Vec::with_capacity(size);
             let read_size = match unistd::read(self.pipe.0, buffer.as_mut_slice()) {
                 Ok(s) => s,
-                Err(err) => {
-                    return Err(BufferError::NixInternal(crate::util::format_nix_error(err)))
-                }
+                Err(err) => return Err(BufferError::NixInternal(err)),
             };
             if read_size < size {
-                return Err(BufferError::NotEnough);
+                Err(BufferError::NotEnough)
             } else {
-                return Ok(buffer);
+                Ok(buffer)
             }
         } else {
-            return match self.byte.get(..size) {
+            match self.byte.get(..size) {
                 Some(b) => Ok(b.to_vec()),
                 None => Err(BufferError::NotEnough),
-            };
-        };
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        if self.is_pipe {
+            let mut pipe_left: usize = 0;
+            unsafe {
+                let ptr: *mut usize = &mut pipe_left;
+                let ret = libc::ioctl(self.pipe.0, libc::FIONREAD, ptr);
+                if ret < 0 {
+                    panic!("iotcl FIONREAD on pipe failed, return fvalue is {}", ret)
+                }
+            }
+            pipe_left
+        } else {
+            self.byte.len()
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }

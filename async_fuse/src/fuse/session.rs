@@ -1,13 +1,11 @@
 //! The implementation of FUSE session
 
-use aligned_bytes::AlignedBytes;
 use anyhow::{anyhow, Context};
 use crossbeam_channel::{Receiver, Sender};
 use crossbeam_utils::atomic::AtomicCell;
 use futures::lock::Mutex;
 use log::{debug, error, info, warn};
 use nix::errno::Errno;
-use nix::unistd;
 use smol::{self, blocking, Task};
 use std::os::unix::io::RawFd;
 use std::path::Path;
@@ -46,8 +44,7 @@ use super::protocol::{
     FUSE_VOL_RENAME, FUSE_XTIMES,
 };
 
-use super::splice::Pipe;
-use super::buffer::UnionBuffer;
+use super::buffer::{UnionBuffer, BufferError};
 
 /// We generally support async reads
 #[cfg(target_os = "linux")]
@@ -184,40 +181,43 @@ impl Session {
                     .detach(); // Run in parallel
                 }
                 Err(err) => {
-                    let err_msg = crate::util::format_nix_error(err); // TODO: refactor format_nix_error()
-                    error!(
-                        "failed to receive from FUSE kernel, the error is: {}",
-                        err_msg
-                    );
-                    match err.as_errno() {
-                        // Operation interrupted. Accordingly to FUSE, this is safe to retry
-                        Some(Errno::ENOENT) => {
-                            info!("operation interrupted, retry.");
-                        }
-                        // Interrupted system call, retry
-                        Some(Errno::EINTR) => {
-                            info!("interrupted system call, retry");
-                        }
-                        // Explicitly try again
-                        Some(Errno::EAGAIN) => info!("Explicitly retry"),
-                        // Filesystem was unmounted, quit the loop
-                        Some(Errno::ENODEV) => {
-                            if FUSE_DESTROYED.load(Ordering::Acquire) {
-                                info!("filesystem destroyed, quit the run loop");
-                            } else {
-                                error!("FUSE device got un-mounted");
+                    if let BufferError::NixInternal(nix_err) = err {
+                        let err_msg = crate::util::format_nix_error(nix_err); // TODO: refactor format_nix_error()
+                        error!(
+                            "failed to receive from FUSE kernel, the error is: {}",
+                            err_msg
+                        );
+                        match nix_err.as_errno() {
+                            // Operation interrupted. Accordingly to FUSE, this is safe to retry
+                            Some(Errno::ENOENT) => {
+                                info!("operation interrupted, retry.");
                             }
-                            break;
-                        }
-                        // Unhandled error
-                        Some(..) | None => {
-                            panic!(
-                                "non-recoverable io error when read FUSE device, \
+                            // Interrupted system call, retry
+                            Some(Errno::EINTR) => {
+                                info!("interrupted system call, retry");
+                            }
+                            // Explicitly try again
+                            Some(Errno::EAGAIN) => info!("Explicitly retry"),
+                            // Filesystem was unmounted, quit the loop
+                            Some(Errno::ENODEV) => {
+                                if FUSE_DESTROYED.load(Ordering::Acquire) {
+                                    info!("filesystem destroyed, quit the run loop");
+                                } else {
+                                    error!("FUSE device got un-mounted");
+                                }
+                                break;
+                            }
+                            // Unhandled error
+                            Some(..) | None => {
+                                panic!(
+                                    "non-recoverable io error when read FUSE device, \
                                     the error is: {}",
-                                err_msg,
-                            );
-                            // break;
+                                    err_msg,
+                                );
+                            }
                         }
+                    } else {
+                        panic!("We should only get BufferError::NixInternal, but we get {}", err);
                     }
                 }
             }
@@ -236,13 +236,8 @@ impl Session {
         proto_version: ProtoVersion,
         splice: bool,
     ) {
-        let bytes = byte_buffer.get(..read_size).unwrap_or_else(|| {
-            panic!(
-                "failed to read {} bytes from the {}-th buffer",
-                read_size, buffer_idx,
-            )
-        });
-        let fuse_req = match Request::new(bytes, read_size, proto_version) {
+        let mut mut_byte_buffer = byte_buffer;
+        let fuse_req = match Request::new(&mut mut_byte_buffer, read_size, proto_version) {
             // Dispatch request
             Ok(r) => r,
             // Quit on illegal request
@@ -260,7 +255,7 @@ impl Session {
                 crate::util::format_nix_error(e), // TODO: refactor format_nix_error()
             );
         }
-        let res = sender.send((buffer_idx, byte_buffer));
+        let res = sender.send((buffer_idx, mut_byte_buffer));
         if let Err(e) = res {
             panic!(
                 "failed to put the {}-th buffer back to buffer pool, the error is: {}",
@@ -298,14 +293,7 @@ impl Session {
         byte_buf = read_result.1;
         if let Ok(read_size) = read_result.0 {
             debug!("read successfully {} byte data from FUSE device", read_size);
-            let bytes = byte_buf.get(..read_size).unwrap_or_else(|| {
-                panic!(
-                    "read_size is greater than buffer size: read_size = {}, buffer size = {}",
-                    read_size,
-                    byte_buf.len()
-                )
-            });
-            if let Ok(req) = Request::new(bytes, self.proto_version.load()) {
+            if let Ok(req) = Request::new(&mut byte_buf, read_size, self.proto_version.load()) {
                 if let Operation::Init { arg } = *req.operation() {
                     let filesystem = Arc::clone(&self.filesystem);
                     self.init(arg, &req, filesystem, fuse_fd).await?;

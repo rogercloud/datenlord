@@ -29,6 +29,8 @@ use crate::fuse::fuse_reply::{
 };
 use crate::fuse::fuse_request::Request;
 use crate::fuse::protocol::{FuseAttr, INum, FUSE_ROOT_ID};
+use crate::fuse::session::{SessionResult, SessionError};
+use crate::wrap_req;
 use crate::util;
 
 mod dir;
@@ -1165,13 +1167,13 @@ impl FileSystem {
     }
 
     /// Return ENOSYS for not implemented operations
-    pub async fn not_implement_helper(
+    pub async fn not_implement_helper<'a>(
         &mut self,
-        req: &Request<'_>,
+        req: Request<'a>,
         fd: RawFd,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
         let reply = ReplyEmpty::new(req.unique(), fd);
-        reply.error_code(Errno::ENOSYS).await
+        wrap_req!(reply.error_code(Errno::ENOSYS).await, req)
     }
 
     // Implemented FUSE operations
@@ -1190,23 +1192,24 @@ impl FileSystem {
 
     /// Clean up filesystem.
     /// Called on filesystem exit.
-    pub fn destroy(&self, req: &Request<'_>) {
+    pub fn destroy<'a>(&self, req: Request<'a>) -> Request<'a> {
         debug!(
             "destroy(req={:?}), cache size={}, trash size={}",
             req,
             self.cache.len(),
             self.trash.len(),
         );
+        req
     }
 
     /// Look up a directory entry by name and get its attributes.
-    pub async fn lookup(
+    pub async fn lookup<'a>(
         &mut self,
-        req: &Request<'_>,
-        parent: INum,
+        req: Request<'a>,
         name: &OsStr,
         reply: ReplyEntry,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
+        let parent = req.nodeid();
         debug!("lookup(parent={}, name={:?}, req={:?})", parent, name, req,);
         let pre_check_res = self.lookup_pre_check(parent, name);
         let (ino, child_type) = match pre_check_res {
@@ -1216,7 +1219,7 @@ impl FileSystem {
                     "lookup() failed to pre-check, the error is: {}",
                     util::format_anyhow_error(&e),
                 );
-                return reply.error(e).await;
+                return wrap_req!(reply.error(e).await, req);
             }
         };
         let lookup_res = self.lookup_helper(parent, ino, name, child_type).await;
@@ -1227,7 +1230,7 @@ impl FileSystem {
                         under parent ino={}, the attr={:?}",
                     name, ino, parent, &fuse_attr,
                 );
-                reply.entry(ttl, fuse_attr, generation).await
+                wrap_req!(reply.entry(ttl, fuse_attr, generation).await, req)
             }
             Err(e) => {
                 debug!(
@@ -1237,13 +1240,13 @@ impl FileSystem {
                     parent,
                     util::format_anyhow_error(&e),
                 );
-                reply.error(e).await
+                wrap_req!(reply.error(e).await, req)
             }
         }
     }
 
     /// Get file attributes.
-    pub async fn getattr(&mut self, req: &Request<'_>, reply: ReplyAttr) -> nix::Result<usize> {
+    pub async fn getattr<'a>(&mut self, req: Request<'a>, reply: ReplyAttr) -> SessionResult<'a> {
         let ino = req.nodeid();
         debug!("getattr(ino={}, req={:?})", ino, req);
 
@@ -1268,7 +1271,7 @@ impl FileSystem {
             node.get_name(),
             attr,
         );
-        reply.attr(ttl, fuse_attr).await
+        wrap_req!(reply.attr(ttl, fuse_attr).await, req)
     }
 
     /// Open a file.
@@ -1279,12 +1282,12 @@ impl FileSystem {
     /// anything in fh. There are also some flags (`direct_io`, `keep_cache`) which the
     /// filesystem may set, to change the way the file is opened. See `fuse_file_info`
     /// structure in `fuse_common.h` for more details.
-    pub async fn open(
+    pub async fn open<'a>(
         &mut self,
-        req: &Request<'_>,
+        req: Request<'a>,
         flags: u32,
         reply: ReplyOpen,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
         let ino = req.nodeid();
         debug!("open(ino={}, flags={}, req={:?})", ino, flags, req);
 
@@ -1310,7 +1313,7 @@ impl FileSystem {
             node.get_ino(),
         ));
         // };
-        match dup_res {
+        wrap_req!(match dup_res {
             Ok(new_fd) => {
                 debug!(
                     "open() successfully duplicated the file handler of ino={} and name={:?}, fd={}, flags={:?}",
@@ -1325,7 +1328,7 @@ impl FileSystem {
                 );
                 reply.error(e).await
             }
-        }
+        }, req)
     }
 
     /// Forget about an inode.
@@ -1335,7 +1338,7 @@ impl FileSystem {
     /// each forget. The filesystem may ignore forget calls, if the inodes don't need to
     /// have a limited lifetime. On unmount it is not guaranteed, that all referenced
     /// inodes will receive a forget message.
-    pub fn forget(&mut self, req: &Request<'_>, nlookup: u64) {
+    pub fn forget<'a>(&mut self, req: Request<'a>, nlookup: u64) -> Request<'a>{
         let ino = req.nodeid();
         debug!("forget(ino={}, nlookup={}, req={:?})", ino, nlookup, req,);
         let current_count: i64;
@@ -1381,15 +1384,16 @@ impl FileSystem {
                 }
             }
         }
+        req
     }
 
     /// Set file attributes.
-    pub async fn setattr(
+    pub async fn setattr<'a>(
         &mut self,
-        req: &Request<'_>,
+        req: Request<'a>,
         param: SetAttrParam,
         reply: ReplyAttr,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
         let ino = req.nodeid();
         let valid = param.valid;
         let fh = param.fh;
@@ -1523,7 +1527,7 @@ impl FileSystem {
                     );
                 }
                 let fuse_attr = fs_util::convert_to_fuse_attr(file_attr);
-                reply.attr(ttl, fuse_attr).await
+                wrap_req!(reply.attr(ttl, fuse_attr).await, req)
             }
             Err(e) => {
                 debug!(
@@ -1532,22 +1536,22 @@ impl FileSystem {
                     inode.get_name(),
                     util::format_anyhow_error(&e),
                 );
-                reply.error(e).await
+                wrap_req!(reply.error(e).await, req)
             }
         }
     }
 
     /// Create file node.
     /// Create a regular file, character device, block device, fifo or socket node.
-    pub async fn mknod(
+    pub async fn mknod<'a>(
         &mut self,
-        req: &Request<'_>,
-        parent: INum,
+        req: Request<'a>,
         name: &OsStr,
         mode: u32,
         rdev: u32,
         reply: ReplyEntry,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
+        let parent = req.nodeid();
         debug!(
             "mknod(parent={}, name={:?}, mode={}, rdev={}, req={:?})",
             parent, name, mode, rdev, req,
@@ -1560,7 +1564,7 @@ impl FileSystem {
                 "mknod() failed to create an i-node name={:?} and mode={:?} under parent ino={},",
                 name, mode, parent,
             ));
-        match mknod_res {
+        wrap_req!(match mknod_res {
             Ok((ttl, fuse_attr, generation)) => reply.entry(ttl, fuse_attr, generation).await,
             Err(e) => {
                 debug!(
@@ -1573,18 +1577,18 @@ impl FileSystem {
                 );
                 reply.error(e).await
             }
-        }
+        }, req)
     }
 
     /// Create a directory.
-    pub async fn mkdir(
+    pub async fn mkdir<'a>(
         &mut self,
-        req: &Request<'_>,
-        parent: INum,
+        req: Request<'a>,
         name: &OsStr,
         mode: u32,
         reply: ReplyEntry,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
+        let parent = req.nodeid();
         debug!(
             "mkdir(parent={}, name={:?}, mode={}, req={:?})",
             parent, name, mode, req,
@@ -1597,7 +1601,7 @@ impl FileSystem {
                 "mkdir() failed to create a directory name={:?} and mode={:?} under parent ino={}",
                 name, mode, parent,
             ));
-        match mkdir_res {
+        wrap_req!(match mkdir_res {
             Ok((ttl, fuse_attr, generation)) => reply.entry(ttl, fuse_attr, generation).await,
             Err(e) => {
                 debug!(
@@ -1610,17 +1614,17 @@ impl FileSystem {
                 );
                 reply.error(e).await
             }
-        }
+        }, req)
     }
 
     /// Remove a file.
-    pub async fn unlink(
+    pub async fn unlink<'a>(
         &mut self,
-        req: &Request<'_>,
-        parent: INum,
+        req: Request<'a>,
         name: &OsStr,
         reply: ReplyEmpty,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
+        let parent = req.nodeid();
         debug!("unlink(parent={}, name={:?}, req={:?}", parent, name, req,);
         let entry_type = {
             let parent_node = self.cache.get(&parent).unwrap_or_else(|| {
@@ -1655,7 +1659,7 @@ impl FileSystem {
                 "unlink() failed to remove file name={:?} under parent ino={}",
                 name, parent,
             ));
-        match unlink_res {
+        wrap_req!(match unlink_res {
             Ok(()) => reply.ok().await,
             Err(e) => {
                 debug!(
@@ -1667,17 +1671,17 @@ impl FileSystem {
                 );
                 reply.error(e).await
             }
-        }
+        }, req)
     }
 
     /// Remove a directory.
-    pub async fn rmdir(
+    pub async fn rmdir<'a>(
         &mut self,
-        req: &Request<'_>,
-        parent: INum,
+        req: Request<'a>,
         name: &OsStr,
         reply: ReplyEmpty,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
+        let parent = req.nodeid();
         let dir_name = OsString::from(name);
         debug!(
             "rmdir(parent={}, name={:?}, req={:?})",
@@ -1690,7 +1694,7 @@ impl FileSystem {
                 "rmdir() failed to remove sub-directory name={:?} under parent ino={}",
                 name, parent,
             ));
-        match rmdir_res {
+        wrap_req!(match rmdir_res {
             Ok(()) => reply.ok().await,
             Err(e) => {
                 debug!(
@@ -1702,7 +1706,7 @@ impl FileSystem {
                 );
                 reply.error(e).await
             }
-        }
+        }, req)
     }
 
     /// Rename a file
@@ -1719,12 +1723,12 @@ impl FileSystem {
     /// instead. If `RENAME_EXCHANGE` is specified, the filesystem
     /// must atomically exchange the two files, i.e. both must
     /// exist and neither may be deleted.
-    pub async fn rename(
+    pub async fn rename<'a>(
         &mut self,
-        req: &Request<'_>,
+        req: Request<'a>,
         param: RenameParam,
         reply: ReplyEmpty,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
         let old_parent = param.old_parent;
         let old_name = param.old_name;
         let new_parent = param.new_parent;
@@ -1748,7 +1752,7 @@ impl FileSystem {
                     "rename() pre-check failed, the error is: {}",
                     util::format_anyhow_error(&e)
                 );
-                return reply.error(e).await;
+                return wrap_req!(reply.error(e).await, req);
             }
         };
         let helper_param = RenameHelperParam {
@@ -1776,7 +1780,7 @@ impl FileSystem {
             )
             .await
         };
-        match rename_res {
+        wrap_req!(match rename_res {
             Ok(()) => reply.ok().await,
             Err(e) => {
                 debug!(
@@ -1785,7 +1789,7 @@ impl FileSystem {
                 );
                 reply.error(e).await
             }
-        }
+        }, req)
     }
 
     /// Read data.
@@ -1795,14 +1799,14 @@ impl FileSystem {
     /// return value of the read system call will reflect the return value of this
     /// operation. fh will contain the value set by the open method, or will be undefined
     /// if the open method didn't set any value.
-    pub async fn read(
+    pub async fn read<'a>(
         &mut self,
-        req: &Request<'_>,
+        req: Request<'a>,
         fh: u64,
         offset: i64,
         size: u32,
         reply: ReplyData,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
         let ino = req.nodeid();
         debug!(
             "read(ino={}, fh={}, offset={}, size={}, req={:?})",
@@ -1832,7 +1836,7 @@ impl FileSystem {
                     inode.get_name(),
                     util::format_anyhow_error(&e),
                 );
-                return reply.error(e).await;
+                return wrap_req!(reply.error(e).await, req);
             }
         }
         let file_data = inode.get_file_data();
@@ -1861,7 +1865,7 @@ impl FileSystem {
         // } else {
         //     panic!("read() cannot read directory data");
         // };
-        match Self::read_helper(file_data, offset.cast(), size.cast()) {
+        wrap_req!(match Self::read_helper(file_data, offset.cast(), size.cast()) {
             Ok(read_data_vec) => {
                 debug!(
                     "read() successfully read {} bytes from the file of ino={} and name={:?}",
@@ -1880,7 +1884,7 @@ impl FileSystem {
                 );
                 reply.error(e).await
             }
-        }
+        }, req)
     }
 
     /// Write data.
@@ -1889,15 +1893,15 @@ impl FileSystem {
     /// which case the return value of the write system call will reflect the return
     /// value of this operation. fh will contain the value set by the open method, or
     /// will be undefined if the open method did not set any value.
-    pub async fn write(
+    pub async fn write<'a>(
         &mut self,
-        req: &Request<'_>,
+        req: Request<'a>,
         fh: u64,
         offset: i64,
         data: Vec<u8>,
         flags: u32,
         reply: ReplyWrite,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
         let ino = req.nodeid();
         debug!(
             "write(ino={}, fh={}, offset={}, data-size={}, flags={})",
@@ -1923,7 +1927,7 @@ impl FileSystem {
         let write_result = inode
             .write_file(fh, offset, data, o_flags, write_to_disk)
             .await;
-        match write_result {
+        wrap_req!(match write_result {
             Ok(written_size) => {
                 debug!(
                     "write() successfully wrote {} byte data to \
@@ -1946,7 +1950,7 @@ impl FileSystem {
                 );
                 reply.error(e).await
             }
-        }
+        }, req)
     }
 
     /// Flush method.
@@ -1959,13 +1963,13 @@ impl FileSystem {
     /// is not forced to flush pending writes. One reason to flush data, is if the
     /// filesystem wants to return write errors. If the filesystem supports file locking
     /// operations (setlk, getlk) it should remove all locks belonging to `lock_owner`.
-    pub async fn flush(
+    pub async fn flush<'a>(
         &mut self,
-        req: &Request<'_>,
+        req: Request<'a>,
         fh: u64,
         lock_owner: u64,
         reply: ReplyEmpty,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
         let ino = req.nodeid();
         debug!(
             "flush(ino={}, fh={}, lock_owner={}, req={:?})",
@@ -1999,7 +2003,7 @@ impl FileSystem {
                     util::format_anyhow_error(&e)
                 )
             });
-        reply.ok().await
+        wrap_req!(reply.ok().await, req)
     }
 
     /// Release an open file.
@@ -2010,15 +2014,15 @@ impl FileSystem {
     /// the release. fh will contain the value set by the open method, or will be undefined
     /// if the open method didn't set any value. flags will contain the same flags as for
     /// open.
-    pub async fn release(
+    pub async fn release<'a>(
         &mut self,
-        req: &Request<'_>,
+        req: Request<'a>,
         fh: u64,
         flags: u32, // same as the open flags
         lock_owner: u64,
         flush: bool,
         reply: ReplyEmpty,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
         let ino = req.nodeid();
         debug!(
             "release(ino={}, fh={}, flags={}, lock_owner={}, flush={}, req={:?})",
@@ -2068,25 +2072,25 @@ impl FileSystem {
             ino,
             inode.get_name(),
         );
-        reply.ok().await
+        wrap_req!(reply.ok().await, req)
     }
 
     /// Synchronize file contents.
     /// If the datasync parameter is non-zero, then only the user data should be flushed,
     /// not the meta data.
-    pub async fn fsync(
+    pub async fn fsync<'a>(
         &mut self,
-        req: &Request<'_>,
+        req: Request<'a>,
         fh: u64,
         datasync: bool,
         reply: ReplyEmpty,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
         let ino = req.nodeid();
         debug!(
             "fsync(ino={}, fh={}, datasync={}, req={:?})",
             ino, fh, datasync, req,
         );
-        match Self::fsync_helper(ino, fh, datasync).await {
+        wrap_req!(match Self::fsync_helper(ino, fh, datasync).await {
             Ok(()) => reply.ok().await,
             Err(e) => {
                 debug!(
@@ -2095,7 +2099,7 @@ impl FileSystem {
                 );
                 reply.error(e).await
             }
-        }
+        }, req)
     }
 
     /// Open a directory.
@@ -2105,12 +2109,12 @@ impl FileSystem {
     /// anything in fh, though that makes it impossible to implement standard conforming
     /// directory stream operations in case the contents of the directory can change
     /// between opendir and releasedir.
-    pub async fn opendir(
+    pub async fn opendir<'a>(
         &mut self,
-        req: &Request<'_>,
+        req: Request<'a>,
         flags: u32,
         reply: ReplyOpen,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
         let ino = req.nodeid();
         debug!("opendir(ino={}, flags={}, req={:?})", ino, flags, req,);
 
@@ -2124,7 +2128,7 @@ impl FileSystem {
 
         let o_flags = fs_util::parse_oflag(flags);
         let dup_res = inode.dup_fd(o_flags).await;
-        match dup_res {
+        wrap_req!(match dup_res {
             Ok(new_fd) => {
                 debug!(
                     "opendir() successfully duplicated the file handler of \
@@ -2145,7 +2149,7 @@ impl FileSystem {
                 );
                 reply.error(e).await
             }
-        }
+        }, req)
     }
 
     /// Read directory.
@@ -2153,13 +2157,13 @@ impl FileSystem {
     /// requested size. Send an empty buffer on end of stream. fh will contain the
     /// value set by the opendir method, or will be undefined if the opendir method
     /// didn't set any value.
-    pub async fn readdir(
+    pub async fn readdir<'a>(
         &mut self,
-        req: &Request<'_>,
+        req: Request<'a>,
         fh: u64,
         offset: i64,
         mut reply: ReplyDirectory,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
         let ino = req.nodeid();
         debug!(
             "readdir(ino={}, fh={}, offset={}, req={:?})",
@@ -2207,7 +2211,7 @@ impl FileSystem {
                     inode.get_name(),
                     util::format_anyhow_error(&e)
                 );
-                return reply.error(e).await;
+                return wrap_req!(reply.error(e).await, req);
             }
         }
         let num_child_entries = inode.read_dir(readdir_helper);
@@ -2218,20 +2222,20 @@ impl FileSystem {
             ino,
             inode.get_name(),
         );
-        reply.ok().await
+        wrap_req!(reply.ok().await, req)
     }
 
     /// Release an open directory.
     /// For every opendir call there will be exactly one releasedir call. fh will
     /// contain the value set by the opendir method, or will be undefined if the
     /// opendir method didn't set any value.
-    pub async fn releasedir(
+    pub async fn releasedir<'a>(
         &mut self,
-        req: &Request<'_>,
+        req: Request<'a>,
         fh: u64,
         flags: u32,
         reply: ReplyEmpty,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
         let ino = req.nodeid();
         debug!(
             "releasedir(ino={}, fh={}, flags={}, req={:?})",
@@ -2265,27 +2269,27 @@ impl FileSystem {
             ino,
             inode.get_name(),
         );
-        reply.ok().await
+        wrap_req!(reply.ok().await, req)
     }
 
     /// Synchronize directory contents.
     /// If the datasync parameter is set, then only the directory contents should
     /// be flushed, not the meta data. fh will contain the value set by the opendir
     /// method, or will be undefined if the opendir method didn't set any value.
-    pub async fn fsyncdir(
+    pub async fn fsyncdir<'a>(
         &mut self,
-        req: &Request<'_>,
+        req: Request<'a>,
         fh: u64,
         datasync: bool,
         reply: ReplyEmpty,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
         let ino = req.nodeid();
         debug!(
             "fsyncdir(ino={}, fh={}, datasync={}, req={:?})",
             ino, fh, datasync, req,
         );
         // Self::fsync_helper(ino, fh, datasync, reply).await
-        match Self::fsync_helper(ino, fh, datasync).await {
+        wrap_req!(match Self::fsync_helper(ino, fh, datasync).await {
             Ok(()) => reply.ok().await,
             Err(e) => {
                 debug!(
@@ -2294,12 +2298,12 @@ impl FileSystem {
                 );
                 reply.error(e).await
             }
-        }
+        }, req)
     }
 
     /// Get file system statistics.
     /// The `f_favail`, `f_fsid` and `f_flag` fields are ignored
-    pub async fn statfs(&mut self, req: &Request<'_>, reply: ReplyStatFs) -> nix::Result<usize> {
+    pub async fn statfs<'a>(&mut self, req: Request<'a>, reply: ReplyStatFs) -> SessionResult<'a> {
         let ino = if req.nodeid() == 0 {
             FUSE_ROOT_ID
         } else {
@@ -2326,7 +2330,7 @@ impl FileSystem {
             ino,
             inode.get_name(),
         ));
-        match statfs_res {
+        wrap_req!(match statfs_res {
             Ok(statvfs) => {
                 debug!(
                     "statfs() successfully read the statvfs of ino={} and name={:?}, the statvfs={:?}",
@@ -2354,11 +2358,11 @@ impl FileSystem {
                 );
                 reply.error(e).await
             }
-        }
+        }, req)
     }
 
     /// Read symbolic link.
-    pub async fn readlink(&mut self, req: &Request<'_>, reply: ReplyData) -> nix::Result<usize> {
+    pub async fn readlink<'a>(&mut self, req: Request<'a>, reply: ReplyData) -> SessionResult<'a> {
         let ino = req.nodeid();
         debug!("readlink(ino={}, req={:?})", ino, req,);
         let symlink_node = self.cache.get(&ino).unwrap_or_else(|| {
@@ -2374,20 +2378,20 @@ impl FileSystem {
             ino,
             symlink_node.get_name(),
         );
-        reply
+        wrap_req!(reply
             .data(target_path.as_os_str().to_owned().into_vec())
-            .await
+            .await, req)
     }
 
     /// Create a symbolic link.
-    pub async fn symlink(
+    pub async fn symlink<'a>(
         &mut self,
-        req: &Request<'_>,
-        parent: INum,
+        req: Request<'a>,
         name: &OsStr,
         target_path: &Path,
         reply: ReplyEntry,
-    ) -> nix::Result<usize> {
+    ) -> SessionResult<'a> {
+        let parent = req.nodeid();
         debug!(
             "symlink(parent={}, name={:?}, target_path={:?}, req={:?})",
             parent, name, target_path, req
@@ -2404,7 +2408,7 @@ impl FileSystem {
             "symlink() failed to create a symlink name={:?} to target path={:?} under parent ino={}",
             name, target_path, parent,
         ));
-        match symlink_res {
+        wrap_req!(match symlink_res {
             Ok((ttl, fuse_attr, generation)) => reply.entry(ttl, fuse_attr, generation).await,
             Err(e) => {
                 debug!(
@@ -2417,13 +2421,13 @@ impl FileSystem {
                 );
                 reply.error(e).await
             }
-        }
+        }, req)
     }
 
     // Un-implemented FUSE operations
 
     /// Interrupt another FUSE request
-    pub fn interrupt(&self, req: &Request<'_>, unique: u64) {
+    pub fn interrupt<'a>(&self, req: Request<'a>, unique: u64) -> Request<'a> {
         debug!(
             "interrupt(req={:?}), cache size={}, trash size={}",
             req,
@@ -2435,80 +2439,82 @@ impl FileSystem {
             "FUSE INTERRUPT recieved, request w/ unique={} interrupted",
             unique
         );
+
+        req
     }
 
     /// Create a hard link.
-    pub async fn link(
+    pub async fn link<'a>(
         &mut self,
-        _req: &Request<'_>,
+        req: Request<'a>,
         _newparent: u64,
         _newname: &OsStr,
         reply: ReplyEntry,
-    ) -> nix::Result<usize> {
-        reply.error_code(Errno::ENOSYS).await
+    ) -> SessionResult<'a> {
+        wrap_req!(reply.error_code(Errno::ENOSYS).await, req)
     }
 
     /// Set an extended attribute.
-    pub async fn setxattr(
+    pub async fn setxattr<'a>(
         &mut self,
-        _req: &Request<'_>,
+        req: Request<'a>,
         _name: &OsStr,
         _value: &[u8],
         _flags: u32,
         _position: u32,
         reply: ReplyEmpty,
-    ) -> nix::Result<usize> {
-        reply.error_code(Errno::ENOSYS).await
+    ) -> SessionResult<'a> {
+        wrap_req!(reply.error_code(Errno::ENOSYS).await, req)
     }
 
     /// Get an extended attribute.
     /// If `size` is 0, the size of the value should be sent with `reply.size()`.
     /// If `size` is not 0, and the value fits, send it with `reply.data()`, or
     /// `reply.error(ERANGE)` if it doesn't.
-    pub async fn getxattr(
+    pub async fn getxattr<'a>(
         &mut self,
-        _req: &Request<'_>,
+        req: Request<'a>,
         _name: &OsStr,
         _size: u32,
         reply: ReplyXAttr,
-    ) -> nix::Result<usize> {
-        reply.error_code(Errno::ENOSYS).await
+    ) -> SessionResult<'a> {
+        wrap_req!(reply.error_code(Errno::ENOSYS).await, req)
     }
 
     /// List extended attribute names.
     /// If `size` is 0, the size of the value should be sent with `reply.size()`.
     /// If `size` is not 0, and the value fits, send it with `reply.data()`, or
     /// `reply.error(ERANGE)` if it doesn't.
-    pub async fn listxattr(
+    pub async fn listxattr<'a>(
         &mut self,
-        _req: &Request<'_>,
+        req: Request<'a>,
         _size: u32,
         reply: ReplyXAttr,
-    ) -> nix::Result<usize> {
-        reply.error_code(Errno::ENOSYS).await
+    ) -> SessionResult<'a> {
+        wrap_req!(reply.error_code(Errno::ENOSYS).await, req)
     }
 
     /// Remove an extended attribute.
-    pub async fn removexattr(
+    pub async fn removexattr<'a>(
         &mut self,
-        _req: &Request<'_>,
+        req: Request<'a>,
         _name: &OsStr,
         reply: ReplyEmpty,
-    ) -> nix::Result<usize> {
-        reply.error_code(Errno::ENOSYS).await
+    ) -> SessionResult<'a> {
+        wrap_req!(reply.error_code(Errno::ENOSYS).await, req)
     }
 
     /// Check file access permissions.
     /// This will be called for the `access()` system call. If the `default_permissions`
     /// mount option is given, this method is not called. This method is not called
     /// under Linux kernel versions 2.4.x
-    pub async fn access(
+    pub async fn access<'a>(
         &mut self,
-        _req: &Request<'_>,
+        req: Request<'a>,
         _mask: u32,
         reply: ReplyEmpty,
-    ) -> nix::Result<usize> {
-        reply.error_code(Errno::ENOSYS).await
+    ) -> SessionResult<'a> {
+        wrap_req!(reply.error_code(Errno::ENOSYS).await, req)
     }
 
     /// Create and open a file.
@@ -2521,26 +2527,25 @@ impl FileSystem {
     /// structure in `fuse_common.h` for more details. If this method is not
     /// implemented or under Linux kernel versions earlier than 2.6.15, the mknod()
     /// and open() methods will be called instead.
-    pub async fn create(
+    pub async fn create<'a>(
         &mut self,
-        _req: &Request<'_>,
-        _parent: u64,
+        req: Request<'a>,
         _name: &OsStr,
         _mode: u32,
         _flags: u32,
         reply: ReplyCreate,
-    ) -> nix::Result<usize> {
-        reply.error_code(Errno::ENOSYS).await
+    ) -> SessionResult<'a> {
+        wrap_req!(reply.error_code(Errno::ENOSYS).await, req)
     }
 
     /// Test for a POSIX file lock.
-    pub async fn getlk(
+    pub async fn getlk<'a>(
         &mut self,
-        _req: &Request<'_>,
+        req: Request<'a>,
         _lk_param: FileLockParam,
         reply: ReplyLock,
-    ) -> nix::Result<usize> {
-        reply.error_code(Errno::ENOSYS).await
+    ) -> SessionResult<'a> {
+        wrap_req!(reply.error_code(Errno::ENOSYS).await, req)
     }
 
     /// Acquire, modify or release a POSIX file lock.
@@ -2550,27 +2555,27 @@ impl FileSystem {
     /// used to fill in this field in `getlk()`. Note: if the locking methods are not
     /// implemented, the kernel will still allow file locking to work locally.
     /// Hence these are only interesting for network filesystems and similar.
-    pub async fn setlk(
+    pub async fn setlk<'a>(
         &mut self,
-        _req: &Request<'_>,
+        req: Request<'a>,
         _lk_param: FileLockParam,
         _sleep: bool,
         reply: ReplyEmpty,
-    ) -> nix::Result<usize> {
-        reply.error_code(Errno::ENOSYS).await
+    ) -> SessionResult<'a> {
+        wrap_req!(reply.error_code(Errno::ENOSYS).await, req)
     }
 
     /// Map block index within file to block index within device.
     /// Note: This makes sense only for block device backed filesystems mounted
     /// with the `blkdev` option
-    pub async fn bmap(
+    pub async fn bmap<'a>(
         &mut self,
-        _req: &Request<'_>,
+        req: Request<'a>,
         _blocksize: u32,
         _idx: u64,
         reply: ReplyBMap,
-    ) -> nix::Result<usize> {
-        reply.error_code(Errno::ENOSYS).await
+    ) -> SessionResult<'a> {
+        wrap_req!(reply.error_code(Errno::ENOSYS).await, req)
     }
 
     /// macOS only: Rename the volume. Set `fuse_init_out.flags` during init to

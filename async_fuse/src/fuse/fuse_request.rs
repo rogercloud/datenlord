@@ -6,7 +6,7 @@ use std::fmt;
 use utilities::Cast;
 
 use super::context::ProtoVersion;
-use super::de::Deserializer;
+use super::de::{Deserializer, DeserializeError};
 #[cfg(target_os = "macos")]
 use super::protocol::FuseExchangeIn;
 use super::protocol::{
@@ -305,7 +305,7 @@ impl<'a> Operation<'a> {
     #[allow(clippy::too_many_lines)]
     fn parse(
         n: u32,
-        data: &mut Deserializer<'a>,
+        data: &'a mut Deserializer,
         #[allow(unused_variables)] proto_version: ProtoVersion,
     ) -> anyhow::Result<Self> {
         let opcode = match n {
@@ -392,7 +392,7 @@ impl<'a> Operation<'a> {
             FuseOpCode::FUSE_SYMLINK => Operation::SymLink {
                 name: data.fetch_os_str()?,
                 link: data.fetch_os_str()?,
-            },
+            } ,
             FuseOpCode::FUSE_MKNOD => Operation::MkNod {
                 arg: data.fetch_ref()?,
                 name: data.fetch_os_str()?,
@@ -732,6 +732,17 @@ pub struct Request<'a> {
     header: &'a FuseInHeader,
     /// FUSE request operation
     operation: Operation<'a>,
+    /// Deserializer
+    de: Option<Deserializer>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RequestError {
+    #[error("WithDeAndDeError")]
+    WithDeAndDeError(Deserializer, DeserializeError),
+
+    #[error("WithDeAndAnyhowError")]
+    WithDeAndAnyhowError(Deserializer, anyhow::Error),
 }
 
 impl fmt::Display for Request<'_> {
@@ -744,13 +755,15 @@ impl fmt::Display for Request<'_> {
     }
 }
 
-impl<'a> Request<'a> {
+impl <'a> Request<'a> {
     /// Build FUSE request
-    pub fn new(bytes: &'a [u8], proto_version: ProtoVersion) -> anyhow::Result<Self> {
-        let data_len = bytes.len();
-        let mut de = Deserializer::new(bytes);
+    pub fn new(mut de: Deserializer, proto_version: ProtoVersion) -> Result<Self, RequestError> {
+        let data_len = de.remaining_len();
         // Parse header
-        let header = de.fetch_ref::<FuseInHeader>()?;
+        let header = match de.fetch_ref::<FuseInHeader>() {
+            Ok(h) => h,
+            Err(err) => return Err(RequestError::WithDeAndDeError(de, err)),
+        };
         // Check data size
         debug_assert!(
             data_len >= header.len.cast(), // TODO: why not daten_len == header.len?
@@ -759,19 +772,26 @@ impl<'a> Request<'a> {
             header.len,
         );
         // Parse/check operation arguments
-        let operation = Operation::parse(header.opcode, &mut de, proto_version)?;
+        let operation = match Operation::parse(header.opcode, &mut de, proto_version) {
+            Ok(op) => op,
+            Err(err) => return Err(RequestError::WithDeAndAnyhowError(de, err)),
+        };
         if de.remaining_len() > 0 {
             warn!(
                 "request bytes is not completely consumed: \
                     bytes.len() = {}, header = {:?}, de.remaining_len() = {}, de = {:?}",
-                bytes.len(),
-                header,
-                de.remaining_len(),
-                de
+                    de.remaining_len(),
+                    header,
+                    de.remaining_len(),
+                    de
             );
         }
 
-        Ok(Self { header, operation })
+        Ok(Self { header, operation, de: Some(de) })
+    }
+
+    pub fn pop_de(self) -> Deserializer {
+        self.de.take().unwrap()
     }
 
     /// Returns the unique identifier of this request.
@@ -820,8 +840,8 @@ impl<'a> Request<'a> {
 
     /// Returns the filesystem operation (and its arguments) of this request.
     #[inline]
-    pub const fn operation(&self) -> &Operation<'_> {
-        &self.operation
+    pub fn operation(self) -> (Self, Operation<'a>) {
+        (self, self.operation)
     }
 }
 
@@ -829,9 +849,8 @@ impl<'a> Request<'a> {
 mod test {
     use super::super::de::DeserializeError;
     use super::*;
+    use super::super::util;
     use log::debug;
-
-    use aligned_bytes::stack::{align8, Align8};
 
     // `FuseInHeader` is aligned to 8 bytes.
     // `Align8` is enough for structs used here.
@@ -841,7 +860,7 @@ mod test {
     // So we have runtime checks in `ByteSlice::fetch` and `ByteSlice::fetch_all_as_slice`.
 
     #[cfg(target_endian = "big")]
-    const INIT_REQUEST: Align8<[u8; 56]> = align8([
+    const INIT_REQUEST: [u8; 56] = [
         0x00, 0x00, 0x00, 0x38, 0x00, 0x00, 0x00, 0x1a, // len, opcode
         0xde, 0xad, 0xbe, 0xef, 0xba, 0xad, 0xd0, 0x0d, // unique
         0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, // nodeid
@@ -849,10 +868,10 @@ mod test {
         0xc0, 0xde, 0xba, 0x5e, 0x00, 0x00, 0x00, 0x00, // pid, padding
         0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x08, // major, minor
         0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, // max_readahead, flags
-    ]);
+    ];
 
     #[cfg(target_endian = "little")]
-    const INIT_REQUEST: Align8<[u8; 56]> = align8([
+    const INIT_REQUEST: [u8; 56] = [
         0x38, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00, // len, opcode
         0x0d, 0xf0, 0xad, 0xba, 0xef, 0xbe, 0xad, 0xde, // unique
         0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid
@@ -860,10 +879,10 @@ mod test {
         0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
         0x07, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, // major, minor
         0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // max_readahead, flags
-    ]);
+    ];
 
     #[cfg(target_endian = "big")]
-    const MKNOD_REQUEST: Align8<[u8; 56]> = align8([
+    const MKNOD_REQUEST: [u8; 56] = [
         0x00, 0x00, 0x00, 0x38, 0x00, 0x00, 0x00, 0x08, // len, opcode
         0xde, 0xad, 0xbe, 0xef, 0xba, 0xad, 0xd0, 0x0d, // unique
         0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, // nodeid
@@ -871,10 +890,10 @@ mod test {
         0xc0, 0xde, 0xba, 0x5e, 0x00, 0x00, 0x00, 0x00, // pid, padding
         0x00, 0x00, 0x01, 0xa4, 0x00, 0x00, 0x00, 0x00, // mode, rdev
         0x66, 0x6f, 0x6f, 0x2e, 0x74, 0x78, 0x74, 0x00, // name
-    ]);
+    ];
 
     #[cfg(target_endian = "little")]
-    const MKNOD_REQUEST: Align8<[u8; 56]> = align8([
+    const MKNOD_REQUEST: [u8; 56] = [
         0x38, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, // len, opcode
         0x0d, 0xf0, 0xad, 0xba, 0xef, 0xbe, 0xad, 0xde, // unique
         0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid
@@ -882,7 +901,7 @@ mod test {
         0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
         0xa4, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mode, rdev
         0x66, 0x6f, 0x6f, 0x2e, 0x74, 0x78, 0x74, 0x00, // name
-    ]);
+    ];
 
     /// assume that kernel protocol version is 7.12
     const PROTO_VERSION: ProtoVersion = ProtoVersion {
@@ -898,27 +917,35 @@ mod test {
             .unwrap_or_else(|| panic!("faile to get the first {} elements from INIT_REQUEST", idx));
 
         let err =
-            Request::new(bytes, PROTO_VERSION).expect_err("Unexpected request parsing result");
-        let mut chain = err.chain();
-        assert_eq!(
-            chain
-                .next()
-                .unwrap_or_else(|| panic!("failed to get next error"))
-                .downcast_ref::<DeserializeError>()
-                .unwrap_or_else(|| panic!("error type not match")),
-            &DeserializeError::NotEnough
-        );
-        assert!(chain.next().is_none());
+            Request::new(util::init_de_with_value(bytes, 8), PROTO_VERSION).expect_err("Unexpected request parsing result");
+        match err {
+            RequestError::WithDeAndDeError(_, de) => {
+                panic!("Should not get DeserializeError here");
+            },
+            RequestError::WithDeAndAnyhowError(_, anyhow_err) => {
+                let mut chain = anyhow_err.chain();
+                assert_eq!(
+                    chain
+                    .next()
+                    .unwrap_or_else(|| panic!("failed to get next error"))
+                    .downcast_ref::<DeserializeError>()
+                    .unwrap_or_else(|| panic!("error type not match")),
+                    &DeserializeError::NotEnough
+                );
+                assert!(chain.next().is_none());
+            },
+        }
     }
 
     #[test]
     #[should_panic(expected = "failed to assert 48 >= 56")]
     fn short_read() {
         let idx = 48;
-        let req = Request::new(
-            INIT_REQUEST.get(..idx).unwrap_or_else(|| {
+        let bytes = INIT_REQUEST.get(..idx).unwrap_or_else(|| {
                 panic!("failed to get first {} elements from INIT_REQUEST", idx)
-            }),
+            });
+        let req = Request::new(
+            util::init_de_with_value(bytes, 8),
             PROTO_VERSION,
         )
         .unwrap_or_else(|err| panic!("failed to build FUSE request, the error is: {}", err));
@@ -927,7 +954,7 @@ mod test {
 
     #[test]
     fn init() {
-        let req = Request::new(&INIT_REQUEST[..], PROTO_VERSION)
+        let req = Request::new(util::init_de_with_value(&INIT_REQUEST, 8), PROTO_VERSION)
             .unwrap_or_else(|err| panic!("failed to build FUSE request, the error is: {}", err));
         assert_eq!(req.header.len, 56);
         assert_eq!(req.header.opcode, 26);
@@ -937,8 +964,8 @@ mod test {
         assert_eq!(req.gid(), 0xc001_cafe);
         assert_eq!(req.pid(), 0xc0de_ba5e);
         #[allow(clippy::wildcard_enum_match_arm)]
-        match *req.operation() {
-            Operation::Init { arg } => {
+        match req.operation() {
+            (req, Operation::Init { arg }) => {
                 assert_eq!(arg.major, 7);
                 assert_eq!(arg.minor, 8);
                 assert_eq!(arg.max_readahead, 4096);
@@ -949,7 +976,7 @@ mod test {
 
     #[test]
     fn mknod() {
-        let req = Request::new(&MKNOD_REQUEST[..], PROTO_VERSION)
+        let req = Request::new(util::init_de_with_value(&MKNOD_REQUEST, 8), PROTO_VERSION)
             .unwrap_or_else(|err| panic!("failed to build FUSE request, the error is: {}", err));
         assert_eq!(req.header.len, 56);
         assert_eq!(req.header.opcode, 8);
@@ -959,8 +986,8 @@ mod test {
         assert_eq!(req.gid(), 0xc001_cafe);
         assert_eq!(req.pid(), 0xc0de_ba5e);
         #[allow(clippy::wildcard_enum_match_arm)]
-        match *req.operation() {
-            Operation::MkNod { arg, name } => {
+        match req.operation() {
+            (_, Operation::MkNod { arg, name }) => {
                 assert_eq!(arg.mode, 0o644);
                 assert_eq!(name, "foo.txt");
             }

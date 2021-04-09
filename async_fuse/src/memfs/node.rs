@@ -8,15 +8,19 @@ use nix::sys::stat::{self, Mode};
 use nix::unistd;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::os::unix::io::RawFd;
+use std::os::unix::{ffi::OsStrExt, io::RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{self, AtomicI64};
+use std::sync::Arc;
 use std::time::SystemTime;
 use utilities::{Cast, OverflowArithmetic};
 
+use super::cache::{GlobalCache, IoMemBlock};
 use super::dir::DirEntry;
 use super::fs_util::{self, FileAttr};
+use crate::fuse::fuse_reply::AsIoVec;
 use crate::fuse::protocol::INum;
+use crate::util;
 
 // /// The symlink target node data
 // #[derive(Debug)]
@@ -166,7 +170,7 @@ enum NodeData {
     /// Directory entry data
     Directory(BTreeMap<OsString, DirEntry>),
     /// File content data
-    RegFile(Vec<u8>),
+    RegFile(Arc<GlobalCache>),
     /// Symlink target data
     // SymLink(Box<SymLinkData>),
     SymLink(PathBuf),
@@ -389,7 +393,7 @@ impl Node {
     pub fn is_node_data_empty(&self) -> bool {
         match self.data {
             NodeData::Directory(ref dir_node) => dir_node.is_empty(),
-            NodeData::RegFile(ref file_node) => file_node.is_empty(),
+            NodeData::RegFile(..) => true, // always check the cache
             NodeData::SymLink(..) => panic!("forbidden to check symlink is empty or not"),
         }
     }
@@ -434,13 +438,30 @@ impl Node {
     }
 
     /// Check whether to load file content data or not
-    pub fn need_load_file_data(&self) -> bool {
+    pub fn need_load_file_data(&self, offset: usize, len: usize) -> bool {
         debug_assert_eq!(
             self.attr.kind,
             SFlag::S_IFREG,
             "fobidden to check non-file node need load data or not",
         );
-        self.need_load_node_data_helper()
+
+        if offset > self.attr.size.cast() {
+            return false;
+        }
+
+        match self.data {
+            NodeData::RegFile(ref cache) => {
+                cache
+                    .get_file_cache(self.name.as_bytes(), offset, len)
+                    .iter()
+                    .filter(|b| !(*b).can_convert())
+                    .count()
+                    != 0
+            }
+            NodeData::Directory(..) | NodeData::SymLink(..) => {
+                panic!("need_load_file_data should handle regular file")
+            }
+        }
     }
 
     // /// Check whether to load symlink target data or not
@@ -735,6 +756,7 @@ impl Node {
         oflags: OFlag,
         mode: Mode,
         create_file: bool,
+        global_cache: Arc<GlobalCache>,
     ) -> anyhow::Result<Self> {
         let ino = self.get_ino();
         let fd = self.fd;
@@ -778,7 +800,7 @@ impl Node {
             self.get_ino(),
             child_file_name,
             child_attr,
-            NodeData::RegFile(Vec::new()),
+            NodeData::RegFile(global_cache),
             child_fd,
         ))
     }
@@ -788,12 +810,14 @@ impl Node {
         &mut self,
         child_file_name: OsString,
         oflags: OFlag,
+        global_cache: Arc<GlobalCache>,
     ) -> anyhow::Result<Self> {
         self.open_child_file_helper(
             child_file_name,
             oflags,
             Mode::empty(),
             false, // create
+            global_cache,
         )
         .await
     }
@@ -804,6 +828,7 @@ impl Node {
         child_file_name: OsString,
         oflags: OFlag,
         mode: Mode,
+        global_cache: Arc<GlobalCache>,
     ) -> anyhow::Result<Self> {
         let create_res = self
             .open_child_file_helper(
@@ -811,6 +836,7 @@ impl Node {
                 oflags,
                 mode,
                 true, // create
+                global_cache,
             )
             .await;
         if create_res.is_ok() {
@@ -820,8 +846,9 @@ impl Node {
     }
 
     // TODO: improve `load_data`, do not load all file content and directory entries at once
-    /// Load data from directory, file or symlink target
-    pub async fn load_data(&mut self) -> anyhow::Result<usize> {
+    /// Load data from directory, file or symlink target.
+    /// The `offset` and `len` is used for regular file
+    pub async fn load_data(&mut self, offset: usize, len: usize) -> anyhow::Result<usize> {
         match self.data {
             NodeData::Directory(..) => {
                 // let dir_entry_map = self.load_dir_data_helper().await?;
@@ -836,18 +863,35 @@ impl Node {
                 );
                 Ok(entry_count)
             }
-            NodeData::RegFile(..) => {
-                // let file_data_vec = self.load_file_data_helper().await?;
-                let file_data_vec =
-                    fs_util::load_file_data(self.get_fd(), self.get_attr().size.cast())
-                        .await
-                        .context("load_data() failed to load file content data")?;
+            NodeData::RegFile(ref global_cache) => {
+                let aligned_offset = global_cache.round_down(offset);
+                let new_len =
+                    global_cache.round_up(offset.overflow_sub(aligned_offset).overflow_add(len));
+
+                let new_len = if new_len.overflow_add(aligned_offset) > self.attr.size.cast() {
+                    self.attr.size.cast::<usize>().overflow_sub(aligned_offset)
+                } else {
+                    new_len
+                };
+
+                let file_data_vec = fs_util::load_file_data(self.get_fd(), aligned_offset, new_len)
+                    .await
+                    .context("load_data() failed to load file content data")?;
                 let read_size = file_data_vec.len();
-                self.data = NodeData::RegFile(file_data_vec);
                 debug!(
                     "load_data() successfully load {} byte file content data",
                     read_size
                 );
+
+                if let Err(e) = global_cache.write_or_update(
+                    self.name.as_bytes(),
+                    aligned_offset,
+                    read_size,
+                    &file_data_vec,
+                ) {
+                    panic!("writing data error while loading data: {}", e);
+                }
+
                 Ok(read_size)
             }
             NodeData::SymLink(..) => {
@@ -1050,12 +1094,12 @@ impl Node {
     // File only methods
 
     /// Get file data
-    pub fn get_file_data(&self) -> &Vec<u8> {
+    pub fn get_file_data(&self, offset: usize, len: usize) -> Vec<IoMemBlock> {
         match self.data {
             NodeData::Directory(..) | NodeData::SymLink(..) => {
                 panic!("forbidden to load FileData from non-file node")
             }
-            NodeData::RegFile(ref file_data) => file_data,
+            NodeData::RegFile(ref cache) => cache.get_file_cache(self.name.as_bytes(), offset, len),
         }
     }
 
@@ -1068,52 +1112,37 @@ impl Node {
         oflags: OFlag,
         write_to_disk: bool,
     ) -> anyhow::Result<usize> {
-        let ino = self.get_ino();
-        let file_data_vec = match self.data {
+        let this: &Self = self;
+
+        let ino = this.get_ino();
+        if this.need_load_file_data(offset.cast(), data.len()) {
+            let load_res = self.load_data(offset.cast(), data.len()).await;
+            if let Err(e) = load_res {
+                debug!(
+                    "read() failed to load file data of ino={} and name={:?}, the error is: {}",
+                    ino,
+                    self.get_name(),
+                    util::format_anyhow_error(&e),
+                );
+                return Err(e);
+            }
+        }
+
+        let cache = match self.data {
             NodeData::Directory(..) | NodeData::SymLink(..) => {
                 panic!("forbidden to load FileData from non-file node")
             }
-            NodeData::RegFile(ref mut file_data) => file_data,
+            NodeData::RegFile(ref file_data) => file_data,
         };
 
-        let size_after_write = data.len().overflow_add(offset.cast::<usize>());
-        if file_data_vec.capacity() < size_after_write {
-            let before_cap = file_data_vec.capacity();
-            let extra_space_size = size_after_write.overflow_sub(file_data_vec.capacity());
-            file_data_vec.reserve(extra_space_size);
-            // TODO: handle OOM when reserving
-            // let result = file_data.try_reserve(extra_space_size);
-            // if result.is_err() {
-            //     warn!(
-            //         "write_file() cannot reserve enough space, \
-            //            the write space needed {} bytes",
-            //         extra_space_size);
-            //     reply.error(ENOMEM);
-            //     return;
-            // }
-            debug!(
-                "write_file() enlarged the file data vector capacity from {} to {}",
-                before_cap,
-                file_data_vec.capacity(),
-            );
+        if let Err(e) = cache.write_or_update(
+            self.name.as_bytes(),
+            offset.cast(),
+            data.len(),
+            data.as_slice(),
+        ) {
+            panic!("writing cache error while writing data: {}", e);
         }
-        match file_data_vec.len().cmp(&(offset.cast())) {
-            std::cmp::Ordering::Greater => {
-                file_data_vec.truncate(offset.cast());
-                debug!(
-                    "write_file() truncated the file of ino={} to size={}",
-                    ino, offset
-                );
-            }
-            std::cmp::Ordering::Less => {
-                let zero_padding_size = offset.cast::<usize>().overflow_sub(file_data_vec.len());
-                let mut zero_padding_vec = vec![0_u8; zero_padding_size];
-                file_data_vec.append(&mut zero_padding_vec);
-            }
-            std::cmp::Ordering::Equal => (),
-        }
-        // TODO: consider zero copy
-        file_data_vec.extend_from_slice(&data);
 
         let fcntl_oflags = fcntl::FcntlArg::F_SETFL(oflags);
         let fd = fh.cast();
@@ -1129,8 +1158,13 @@ impl Node {
                 .context("write_file() failed to write to disk")?;
             debug_assert_eq!(data_len, written_size);
         }
+
         // update the attribute of the written file
-        self.attr.size = file_data_vec.len().cast();
+        self.attr.size = std::cmp::max(
+            self.attr.size,
+            (offset.cast::<u64>()).overflow_add(written_size.cast()),
+        );
+        debug!("file {:?} size = {:?}", self.name, self.attr.size);
         self.update_mtime_ctime_to_now();
 
         Ok(written_size)

@@ -40,6 +40,7 @@ mod cache;
 mod dir;
 mod fs_util;
 mod node;
+mod s3_wrapper;
 use dir::DirEntry;
 use fs_util::FileAttr;
 use node::Node;
@@ -818,7 +819,7 @@ impl MetaData {
                         "rename_exchange_helper() failed to load attributed of to i-node of ino={} and name={:?}, \
                             the error is: {}",
                         exchanged_node.get_ino(), exchanged_node.get_name(),
-                        util::format_anyhow_error(&e),
+                        common::util::format_anyhow_error(&e),
                     )
                 });
             debug_assert_eq!(exchanged_attr.ino, exchanged_node.get_ino());
@@ -896,7 +897,7 @@ impl MetaData {
                 .unwrap_or_else(|e| {
                     panic!(
                         "rename() failed, the error is: {}",
-                        util::format_anyhow_error(&e)
+                        common::util::format_anyhow_error(&e)
                     )
                 });
             debug_assert_eq!(moved_attr.ino, moved_node.get_ino());
@@ -1215,7 +1216,7 @@ impl FileSystem for MemFs {
             Err(e) => {
                 debug!(
                     "lookup() failed to pre-check, the error is: {}",
-                    util::format_anyhow_error(&e),
+                    common::util::format_anyhow_error(&e),
                 );
                 return reply.error(e).await;
             }
@@ -1236,7 +1237,7 @@ impl FileSystem for MemFs {
                         the error is: {}",
                     name,
                     parent,
-                    util::format_anyhow_error(&e),
+                    common::util::format_anyhow_error(&e),
                 );
                 reply.error(e).await
             }
@@ -1323,7 +1324,7 @@ impl FileSystem for MemFs {
             Err(e) => {
                 debug!(
                     "open() failed, the error is: {}",
-                    util::format_anyhow_error(&e)
+                    common::util::format_anyhow_error(&e)
                 );
                 reply.error(e).await
             }
@@ -1541,7 +1542,7 @@ impl FileSystem for MemFs {
                     "setattr() failed to set the attribute of ino={} and name={:?}, the error is: {}",
                     ino,
                     inode.get_name(),
-                    util::format_anyhow_error(&e),
+                    common::util::format_anyhow_error(&e),
                 );
                 reply.error(e).await
             }
@@ -1582,7 +1583,7 @@ impl FileSystem for MemFs {
                     name,
                     mode,
                     parent,
-                    util::format_anyhow_error(&e),
+                    common::util::format_anyhow_error(&e),
                 );
                 reply.error(e).await
             }
@@ -1621,7 +1622,7 @@ impl FileSystem for MemFs {
                     name,
                     mode,
                     parent,
-                    util::format_anyhow_error(&e),
+                    common::util::format_anyhow_error(&e),
                 );
                 reply.error(e).await
             }
@@ -1681,7 +1682,7 @@ impl FileSystem for MemFs {
                         the error is: {}",
                     name,
                     parent,
-                    util::format_anyhow_error(&e),
+                    common::util::format_anyhow_error(&e),
                 );
                 reply.error(e).await
             }
@@ -1718,7 +1719,7 @@ impl FileSystem for MemFs {
                             the error is: {}",
                     name,
                     parent,
-                    util::format_anyhow_error(&e),
+                    common::util::format_anyhow_error(&e),
                 );
                 reply.error(e).await
             }
@@ -1769,7 +1770,7 @@ impl FileSystem for MemFs {
             Err(e) => {
                 debug!(
                     "rename() pre-check failed, the error is: {}",
-                    util::format_anyhow_error(&e)
+                    common::util::format_anyhow_error(&e)
                 );
                 return reply.error(e).await;
             }
@@ -1804,7 +1805,7 @@ impl FileSystem for MemFs {
             Err(e) => {
                 debug!(
                     "rename() failed, the error is: {}",
-                    util::format_anyhow_error(&e)
+                    common::util::format_anyhow_error(&e)
                 );
                 reply.error(e).await
             }
@@ -1863,7 +1864,7 @@ impl FileSystem for MemFs {
                     "read() failed to load file data of ino={} and name={:?}, the error is: {}",
                     ino,
                     inode.get_name(),
-                    util::format_anyhow_error(&e),
+                    common::util::format_anyhow_error(&e),
                 );
                 return reply.error(e).await;
             }
@@ -1876,7 +1877,7 @@ impl FileSystem for MemFs {
         //         if let Err(e) = load_res {
         //             debug!(
         //                 "read() failed to load symlink target data, the error is: {}",
-        //                 util::format_anyhow_error(&e)
+        //                 common::util::format_anyhow_error(&e)
         //             );
         //             return reply.error(e).await;
         //         }
@@ -1910,7 +1911,7 @@ impl FileSystem for MemFs {
                     "read() failed to read from the file of ino={} and name={:?}, the error is: {}",
                     ino,
                     inode.get_name(),
-                    util::format_anyhow_error(&e),
+                    common::util::format_anyhow_error(&e),
                 );
                 reply.error(e).await
             }
@@ -1979,7 +1980,7 @@ impl FileSystem for MemFs {
                     ino,
                     inode.get_name(),
                     offset,
-                    util::format_anyhow_error(&e),
+                    common::util::format_anyhow_error(&e),
                 );
                 reply.error(e).await
             }
@@ -2023,7 +2024,7 @@ impl FileSystem for MemFs {
             .unwrap_or_else(|e| {
                 panic!(
                     "flush() failed, the error is: {}",
-                    util::format_anyhow_error(&e)
+                    common::util::format_anyhow_error(&e)
                 )
             });
         smol::unblock(move || unistd::close(new_fd))
@@ -2035,7 +2036,7 @@ impl FileSystem for MemFs {
             .unwrap_or_else(|e| {
                 panic!(
                     "flush() failed, the error is: {}",
-                    util::format_anyhow_error(&e)
+                    common::util::format_anyhow_error(&e)
                 )
             });
         reply.ok().await
@@ -2087,7 +2088,7 @@ impl FileSystem for MemFs {
                 .unwrap_or_else(|e| {
                     panic!(
                         "release() failed, the error is: {}",
-                        util::format_anyhow_error(&e)
+                        common::util::format_anyhow_error(&e)
                     );
                 });
         }
@@ -2102,7 +2103,7 @@ impl FileSystem for MemFs {
             .unwrap_or_else(|e| {
                 panic!(
                     "release() failed, the error is: {}",
-                    util::format_anyhow_error(&e)
+                    common::util::format_anyhow_error(&e)
                 );
             });
         inode.dec_open_count(); // decrease open count before reply in case reply failed
@@ -2135,7 +2136,7 @@ impl FileSystem for MemFs {
             Err(e) => {
                 debug!(
                     "fsync() failed, the error is: {}",
-                    util::format_anyhow_error(&e)
+                    common::util::format_anyhow_error(&e)
                 );
                 reply.error(e).await
             }
@@ -2183,7 +2184,7 @@ impl FileSystem for MemFs {
                     "opendir() failed to duplicate the file handler of ino={} and name={:?} with flags={:?}, \
                         the error is: {}",
                     ino, inode.get_name(), o_flags,
-                    util::format_anyhow_error(&e)
+                    common::util::format_anyhow_error(&e)
                 );
                 reply.error(e).await
             }
@@ -2250,7 +2251,7 @@ impl FileSystem for MemFs {
                         the error is: {}",
                     ino,
                     inode.get_name(),
-                    util::format_anyhow_error(&e)
+                    common::util::format_anyhow_error(&e)
                 );
                 return reply.error(e).await;
             }
@@ -2304,7 +2305,7 @@ impl FileSystem for MemFs {
             .unwrap_or_else(|e| {
                 panic!(
                     "releasedir() failed, the error is: {}",
-                    util::format_anyhow_error(&e),
+                    common::util::format_anyhow_error(&e),
                 );
             });
         inode.dec_open_count();
@@ -2339,7 +2340,7 @@ impl FileSystem for MemFs {
             Err(e) => {
                 debug!(
                     "fsyncdir() failed, the error is: {}",
-                    util::format_anyhow_error(&e)
+                    common::util::format_anyhow_error(&e)
                 );
                 reply.error(e).await
             }
@@ -2403,7 +2404,7 @@ impl FileSystem for MemFs {
                     "statfs() failed to read the statvfs of ino={} and name={:?}, the error is: {}",
                     ino,
                     inode.get_name(),
-                    util::format_anyhow_error(&e)
+                    common::util::format_anyhow_error(&e)
                 );
                 reply.error(e).await
             }
@@ -2472,7 +2473,7 @@ impl FileSystem for MemFs {
                     name,
                     target_path,
                     parent,
-                    util::format_anyhow_error(&e),
+                    common::util::format_anyhow_error(&e),
                 );
                 reply.error(e).await
             }

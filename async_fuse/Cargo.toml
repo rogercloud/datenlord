@@ -17,6 +17,7 @@ aligned-utils = "1.0.0"
 anyhow = "1.0.31"
 async-trait = "0.1.48"
 better-as = "0.2.0"
+chrono = "0.4.19"
 clap = "2.33.3"
 common = {path = "../common"}
 crossbeam-channel = "0.5.0"
@@ -25,6 +26,7 @@ crossbeam-utils = "0.8.1"
 env_logger = "0.8.1"
 event-listener = "2.5.1"
 futures = "0.3.5"
+itertools = "0.10.0"
 libc = "0.2.79"
 lockfree-cuckoohash = {git = "https://github.com/datenlord/lockfree-cuckoohash", rev = "e5849f18"}
 log = "0.4.6"
@@ -35,8 +37,9 @@ parking_lot = "0.11.1"
 pin-project-lite ="0.2.0"
 priority-queue = "1.1.0"
 ring-io = { git = "https://github.com/datenlord/ring-io", rev = "2f0506c" }
+serde-xml-rs = "0.4" 
 smol = { version = "1.2.5" }
-rust-s3 = {git="https://github.com/rogercloud/rust-s3", rev = "5f6725e"}
+rust-s3 = {git="https://github.com/rogercloud/rust-s3", rev = "c1fa1b9", features = ["with-async-std"], default-features = false}
 thiserror = "1.0.22"
 utilities = { git = "https://github.com/datenlord/utilities", rev = "4ef408d" }
 

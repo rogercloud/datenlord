@@ -1,25 +1,35 @@
 //! The etcd client implementation
 
+use super::error::{Context, DatenLordResult};
+use super::util;
 use async_compat::Compat;
 use log::debug;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::fmt;
 use std::fmt::Debug;
 use std::time::Duration;
-
-use super::error::{Context, DatenLordResult};
-use super::util;
 
 /// The client to communicate with etcd
 #[derive(Clone)]
 pub struct EtcdDelegate {
     /// The inner etcd client
     etcd_rs_client: etcd_client::Client,
+    end_point: Vec<String>,
+}
+
+impl fmt::Debug for EtcdDelegate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EtcdDelegate")
+            .field("endpoint", &self.end_point)
+            .finish()
+    }
 }
 
 impl EtcdDelegate {
     /// Build etcd client
     pub fn new(etcd_address_vec: Vec<String>) -> DatenLordResult<Self> {
+        let end_point = etcd_address_vec.clone();
         let etcd_rs_client = smol::block_on(Compat::new(async move {
             etcd_client::Client::connect(etcd_client::ClientConfig {
                 endpoints: etcd_address_vec.clone(),
@@ -36,7 +46,10 @@ impl EtcdDelegate {
                 )
             })
         }))?;
-        Ok(Self { etcd_rs_client })
+        Ok(Self {
+            etcd_rs_client,
+            end_point,
+        })
     }
 
     /// Lock a name with time out
@@ -89,12 +102,16 @@ impl EtcdDelegate {
     }
 
     /// Get one key-value pair from etcd
-    async fn get_one_kv_async<T: DeserializeOwned>(&self, key: &str) -> DatenLordResult<Option<T>> {
+    async fn get_one_kv_async<T: DeserializeOwned, K: Into<Vec<u8>> + Debug + Clone>(
+        &self,
+        key: K,
+    ) -> DatenLordResult<Option<T>> {
+        let key_clone = key.clone();
         let req = etcd_client::EtcdRangeRequest::new(etcd_client::KeyRange::key(key));
         let mut resp = self.etcd_rs_client.kv().range(req).await.with_context(|| {
             format!(
                 "failed to get RangeResponse of one key-value pair from etcd, the key={:?}",
-                key
+                key_clone
             )
         })?;
 
@@ -106,11 +123,15 @@ impl EtcdDelegate {
     }
 
     /// Write a key value pair to etcd
-    async fn write_to_etcd<T: DeserializeOwned + Serialize + Clone + Debug + Send + Sync>(
+    async fn write_to_etcd<
+        T: DeserializeOwned + Serialize + Clone + Debug + Send + Sync,
+        K: Into<Vec<u8>> + Debug + Clone,
+    >(
         &self,
-        key: &str,
+        key: K,
         value: &T,
     ) -> DatenLordResult<Option<T>> {
+        let key_clone = key.clone();
         let bin_value = bincode::serialize(value)
             .with_context(|| format!("failed to encode {:?} to binary", value))?;
         let mut req = etcd_client::EtcdPutRequest::new(key, bin_value);
@@ -118,7 +139,7 @@ impl EtcdDelegate {
         let mut resp = self.etcd_rs_client.kv().put(req).await.with_context(|| {
             format!(
                 "failed to get PutResponse from etcd for key={:?}, value={:?}",
-                key, value,
+                key_clone, value,
             )
         })?;
         if let Some(pre_kv) = resp.take_prev_kv() {
@@ -174,9 +195,9 @@ impl EtcdDelegate {
     }
 
     /// Get zero or one key-value pair from etcd
-    pub async fn get_at_most_one_value<T: DeserializeOwned>(
+    pub async fn get_at_most_one_value<T: DeserializeOwned, K: Into<Vec<u8>> + Debug + Clone>(
         &self,
-        key: &str,
+        key: K,
     ) -> DatenLordResult<Option<T>> {
         let value = self.get_one_kv_async(key).await?;
         Ok(value)
@@ -219,16 +240,18 @@ impl EtcdDelegate {
     /// Write key value pair to etcd, if key exists, update it
     pub async fn write_or_update_kv<
         T: DeserializeOwned + Serialize + Clone + Debug + Send + Sync,
+        K: Into<Vec<u8>> + Debug + Clone,
     >(
         &self,
-        key: &str,
+        key: K,
         value: &T,
     ) -> DatenLordResult<()> {
+        let key_clone = key.clone();
         let write_res = self.write_to_etcd(key, value).await?;
         if let Some(pre_value) = write_res {
             debug!(
-                "key={} exists in etcd, the previous value={:?}, update it",
-                key, pre_value
+                "key={:?} exists in etcd, the previous value={:?}, update it",
+                key_clone, pre_value
             );
         }
         Ok(())

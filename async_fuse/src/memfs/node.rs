@@ -27,6 +27,7 @@ use utilities::{Cast, OverflowArithmetic};
 #[async_trait]
 pub trait Node: Sized {
     fn get_ino(&self) -> INum;
+    fn set_ino(&mut self, ino: INum);
     fn get_fd(&self) -> RawFd;
     fn get_parent_ino(&self) -> INum;
     fn set_parent_ino(&mut self, parent: u64) -> INum;
@@ -34,7 +35,7 @@ pub trait Node: Sized {
     fn set_name(&mut self, name: &str);
     fn get_type(&self) -> SFlag;
     fn get_attr(&self) -> FileAttr;
-    fn set_attr(&mut self, new_attr: FileAttr) -> FileAttr;
+    async fn set_attr(&mut self, new_attr: FileAttr) -> FileAttr;
     fn lookup_attr(&self) -> FileAttr;
     fn get_open_count(&self) -> i64;
     fn dec_open_count(&self) -> i64;
@@ -69,8 +70,8 @@ pub trait Node: Sized {
         global_cache: Arc<GlobalCache>,
     ) -> anyhow::Result<Self>;
     async fn load_data(&mut self, offset: usize, len: usize) -> anyhow::Result<usize>;
-    fn insert_entry_for_rename(&mut self, child_entry: DirEntry) -> Option<DirEntry>;
-    fn remove_entry_for_rename(&mut self, child_name: &str) -> Option<DirEntry>;
+    async fn insert_entry_for_rename(&mut self, child_entry: DirEntry) -> Option<DirEntry>;
+    async fn remove_entry_for_rename(&mut self, child_name: &str) -> Option<DirEntry>;
     async fn unlink_entry(&mut self, child_name: &str) -> anyhow::Result<DirEntry>;
     fn read_dir(&self, func: &mut dyn FnMut(&BTreeMap<String, DirEntry>) -> usize) -> usize;
     fn get_symlink_target(&self) -> &Path;
@@ -164,12 +165,12 @@ impl DefaultNode {
     }
 
     /// Update mtime and ctime to now
-    fn update_mtime_ctime_to_now(&mut self) {
+    async fn update_mtime_ctime_to_now(&mut self) {
         let mut attr = self.get_attr();
         let st_now = SystemTime::now();
         attr.mtime = st_now;
         attr.ctime = st_now;
-        self.set_attr(attr);
+        self.set_attr(attr).await;
     }
 
     /// Increase node lookup count
@@ -587,6 +588,11 @@ impl Node for DefaultNode {
         self.get_attr().ino
     }
 
+    #[inline]
+    fn set_ino(&mut self, ino: INum) {
+        self.attr.ino = ino;
+    }
+
     /// Get node fd
     #[inline]
     fn get_fd(&self) -> RawFd {
@@ -634,7 +640,7 @@ impl Node for DefaultNode {
     }
 
     /// Set node attribute
-    fn set_attr(&mut self, new_attr: FileAttr) -> FileAttr {
+    async fn set_attr(&mut self, new_attr: FileAttr) -> FileAttr {
         let old_attr = self.get_attr();
         match self.data {
             DefaultNodeData::Directory(..) => debug_assert_eq!(new_attr.kind, SFlag::S_IFDIR),
@@ -806,7 +812,7 @@ impl Node for DefaultNode {
             .create_or_load_child_symlink_helper(child_symlink_name, Some(target_path))
             .await;
         if create_res.is_ok() {
-            self.update_mtime_ctime_to_now();
+            self.update_mtime_ctime_to_now().await;
         }
         create_res
     }
@@ -837,7 +843,7 @@ impl Node for DefaultNode {
             )
             .await;
         if create_res.is_ok() {
-            self.update_mtime_ctime_to_now();
+            self.update_mtime_ctime_to_now().await;
         }
         create_res
     }
@@ -877,7 +883,7 @@ impl Node for DefaultNode {
             )
             .await;
         if create_res.is_ok() {
-            self.update_mtime_ctime_to_now();
+            self.update_mtime_ctime_to_now().await;
         }
         create_res
     }
@@ -949,10 +955,10 @@ impl Node for DefaultNode {
     }
 
     /// Insert directory entry for rename()
-    fn insert_entry_for_rename(&mut self, child_entry: DirEntry) -> Option<DirEntry> {
+    async fn insert_entry_for_rename(&mut self, child_entry: DirEntry) -> Option<DirEntry> {
         let dir_data = self.get_dir_data_mut();
         let previous_entry = dir_data.insert(child_entry.entry_name().into(), child_entry);
-        self.update_mtime_ctime_to_now();
+        self.update_mtime_ctime_to_now().await;
         debug!(
             "insert_entry_for_rename() successfully inserted new entry \
                 and replaced previous entry={:?}",
@@ -963,11 +969,11 @@ impl Node for DefaultNode {
     }
 
     /// Remove directory entry from cache only for rename()
-    fn remove_entry_for_rename(&mut self, child_name: &str) -> Option<DirEntry> {
+    async fn remove_entry_for_rename(&mut self, child_name: &str) -> Option<DirEntry> {
         let dir_data = self.get_dir_data_mut();
         let remove_res = dir_data.remove(child_name);
         if remove_res.is_some() {
-            self.update_mtime_ctime_to_now();
+            self.update_mtime_ctime_to_now().await;
         }
         remove_res
     }
@@ -1021,7 +1027,7 @@ impl Node for DefaultNode {
                 removed_entry.entry_type()
             ),
         }
-        self.update_mtime_ctime_to_now();
+        self.update_mtime_ctime_to_now().await;
         Ok(removed_entry)
     }
 
@@ -1142,7 +1148,7 @@ impl Node for DefaultNode {
             (offset.cast::<u64>()).overflow_add(written_size.cast()),
         );
         debug!("file {:?} size = {:?}", self.name, self.attr.size);
-        self.update_mtime_ctime_to_now();
+        self.update_mtime_ctime_to_now().await;
 
         Ok(written_size)
     }

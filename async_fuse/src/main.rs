@@ -40,15 +40,15 @@
     // clippy::panic_in_result_fn,
 )]
 
-use log::debug;
-
 mod fuse;
 mod memfs;
 pub mod proactor;
 pub mod util;
 use common::etcd_delegate::EtcdDelegate;
 use fuse::session::Session;
+use log::debug;
 use memfs::dist;
+use memfs::s3_wrapper::{DoNothingImpl, S3BackEndImpl};
 
 /// Service port number
 const PORT_NUM_ARG_NAME: &str = "port";
@@ -69,6 +69,7 @@ const CACHE_DEFAULT_CAPACITY: usize = 10 * 1024 * 1024 * 1024;
 const DEFAULT_PORT_NUM: &str = "8089";
 
 enum VolumeType {
+    None,
     S3,
     Local,
 }
@@ -189,6 +190,8 @@ fn main() -> anyhow::Result<()> {
         Some(vt) => {
             if vt == "s3" {
                 VolumeType::S3
+            } else if vt == "none" {
+                VolumeType::None
             } else {
                 VolumeType::Local
             }
@@ -221,7 +224,21 @@ fn main() -> anyhow::Result<()> {
                 ss.run().await?;
             }
             VolumeType::S3 => {
-                let fs: memfs::MemFs<memfs::S3MetaData> = memfs::MemFs::new(
+                let fs: memfs::MemFs<memfs::S3MetaData<S3BackEndImpl>> = memfs::MemFs::new(
+                    volume_info,
+                    cache_capacity,
+                    &ip,
+                    port,
+                    etcd_delegate,
+                    node_id,
+                    volume_info,
+                )
+                .await?;
+                let ss = Session::new(mount_point, fs).await?;
+                ss.run().await?;
+            }
+            VolumeType::None => {
+                let fs: memfs::MemFs<memfs::S3MetaData<DoNothingImpl>> = memfs::MemFs::new(
                     volume_info,
                     cache_capacity,
                     &ip,
